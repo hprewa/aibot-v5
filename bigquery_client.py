@@ -10,6 +10,7 @@ from typing import Optional, Dict, List, Any
 from google.api_core import retry
 from datetime import datetime, timedelta
 import pandas as pd
+import uuid
 
 class BigQueryClient:
     """Client for interacting with BigQuery tables"""
@@ -29,7 +30,9 @@ class BigQueryClient:
             "orders": f"{self.project_id}.{self.dataset_id}.orders_drt",
             "slot_availability": f"{self.project_id}.{self.dataset_id}.slot_availability_drt",
             "cfc_spoke_mapping": f"{self.project_id}.{self.dataset_id}.cfc_spoke_mapping",
-            "sessions": f"{self.project_id}.{self.dataset_id}.sessions"  # Explicitly add sessions table
+            "sessions": f"{self.project_id}.{self.dataset_id}.sessions",  # Explicitly add sessions table
+            "question_classifications": f"{self.project_id}.{self.dataset_id}.question_classifications",  # Add question classifications table
+            "question_categories": f"{self.project_id}.{self.dataset_id}.question_categories"  # Add question categories table
         }
         
         print("Table references:")
@@ -43,6 +46,12 @@ class BigQueryClient:
         
         # Ensure sessions table exists
         self._ensure_sessions_table_exists()
+        
+        # Ensure question classifications table exists
+        self._ensure_question_classifications_table_exists()
+        
+        # Ensure question categories table exists
+        self._ensure_question_categories_table_exists()
         
     def _ensure_sessions_table_exists(self):
         """Ensure the sessions table exists, create it if it doesn't"""
@@ -399,5 +408,362 @@ class BigQueryClient:
         query_job = self.client.query(query)
         results = query_job.result()
         return [dict(row.items()) for row in results]
+
+    def _ensure_question_classifications_table_exists(self):
+        """Ensure the question_classifications table exists, create it if it doesn't"""
+        try:
+            # Check if classifications table exists
+            classifications_table_id = self.tables["question_classifications"]
+            table_exists = False
+            
+            try:
+                table = self.client.get_table(classifications_table_id)
+                print(f"Question classifications table {classifications_table_id} exists")
+                table_exists = True
+                
+                # Update schema cache
+                self.schema_cache["question_classifications"] = table.schema
+            except Exception as e:
+                print(f"Question classifications table {classifications_table_id} does not exist, creating it...")
+                table_exists = False
+            
+            if not table_exists:
+                # Define schema for question_classifications table
+                schema = [
+                    bigquery.SchemaField("id", "STRING", mode="REQUIRED"),  # Unique ID for each classification entry
+                    bigquery.SchemaField("question", "STRING", mode="REQUIRED"),  # The original question text
+                    bigquery.SchemaField("question_type", "STRING", mode="REQUIRED"),  # The classified question type
+                    bigquery.SchemaField("confidence", "FLOAT", mode="REQUIRED"),  # Confidence score of classification
+                    bigquery.SchemaField("requires_sql", "BOOLEAN", mode="REQUIRED"),  # Whether SQL generation is needed
+                    bigquery.SchemaField("requires_summary", "BOOLEAN", mode="REQUIRED"),  # Whether summary generation is needed
+                    bigquery.SchemaField("classification_metadata", "STRING", mode="NULLABLE"),  # Additional classification metadata as JSON
+                    bigquery.SchemaField("session_id", "STRING", mode="NULLABLE"),  # Associated session ID if any
+                    bigquery.SchemaField("created_at", "TIMESTAMP", mode="REQUIRED"),  # When the classification was created
+                    bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED")   # When the classification was last updated
+                ]
+                
+                # Create table
+                table = bigquery.Table(classifications_table_id, schema=schema)
+                
+                try:
+                    self.client.create_table(table)
+                    print(f"Created question classifications table {classifications_table_id}")
+                    
+                    # Add to schema cache
+                    self.schema_cache["question_classifications"] = schema
+                except Exception as create_error:
+                    print(f"Error creating question classifications table: {str(create_error)}")
+                    raise
+                
+        except Exception as e:
+            print(f"Error ensuring question classifications table exists: {str(e)}")
+            raise
+    
+    def get_question_classification(self, question: str) -> Optional[Dict[str, Any]]:
+        """Get an existing classification for a question if available"""
+        query = f"""
+            SELECT id, question, question_type, confidence, requires_sql, requires_summary, 
+                   classification_metadata, session_id, created_at, updated_at
+            FROM `{self.tables["question_classifications"]}`
+            WHERE question = @question
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("question", "STRING", question),
+            ]
+        )
+        
+        try:
+            result = self.client.query(query, job_config=job_config).to_dataframe()
+            
+            if result.empty:
+                return None
+                
+            # Convert the first row to a dictionary
+            classification = result.iloc[0].to_dict()
+            
+            # Parse JSON fields
+            if classification.get("classification_metadata") and isinstance(classification["classification_metadata"], str):
+                try:
+                    classification["classification_metadata"] = json.loads(classification["classification_metadata"])
+                except json.JSONDecodeError:
+                    classification["classification_metadata"] = {}
+            
+            return classification
+        except Exception as e:
+            print(f"Error getting question classification: {str(e)}")
+            return None
+    
+    def save_question_classification(self, classification_data: Dict[str, Any]) -> str:
+        """Save a question classification to BigQuery"""
+        # Generate a unique ID if not provided
+        if "id" not in classification_data:
+            classification_data["id"] = str(uuid.uuid4())
+            
+        # Set timestamps if not provided
+        current_time = datetime.utcnow().isoformat()
+        if "created_at" not in classification_data:
+            classification_data["created_at"] = current_time
+        if "updated_at" not in classification_data:
+            classification_data["updated_at"] = current_time
+            
+        # Serialize classification_metadata if it's a dictionary
+        if "classification_metadata" in classification_data and isinstance(classification_data["classification_metadata"], dict):
+            classification_data["classification_metadata"] = json.dumps(classification_data["classification_metadata"])
+            
+        # Insert the classification data
+        self.insert_row(self.tables["question_classifications"], classification_data)
+        
+        return classification_data["id"]
+
+    def get_question_categories(self) -> List[Dict[str, Any]]:
+        """Retrieve question categories from BigQuery
+        
+        Returns:
+            List of dictionaries containing question categories with fields:
+            - category_id: Numeric ID of the category
+            - question_type: Category name
+            - description: Category description
+            - example: Example question for this category
+        """
+        try:
+            # Check if question_categories table exists
+            categories_table = self.tables["question_categories"]
+            try:
+                self.client.get_table(categories_table)
+            except Exception as e:
+                print(f"Question categories table does not exist. Creating it with default categories...")
+                self._create_default_question_categories_table()
+            
+            # Query the categories
+            query = f"""
+                SELECT 
+                    category_id, 
+                    question_type,
+                    description,
+                    example
+                FROM `{self.project_id}.{self.dataset_id}.question_categories`
+                ORDER BY category_id ASC
+            """
+            
+            results = self.client.query(query).result()
+            categories = [dict(row) for row in results]
+            
+            print(f"Retrieved {len(categories)} question categories from BigQuery")
+            return categories
+        except Exception as e:
+            print(f"Error retrieving question categories: {str(e)}")
+            # Return empty list as fallback
+            return []
+        
+    def _create_default_question_categories_table(self):
+        """Create the question_categories table with default categories"""
+        try:
+            # Define schema
+            categories_table = self.tables["question_categories"]
+            schema = [
+                bigquery.SchemaField("category_id", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("question_type", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("description", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("example", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("created_at", "TIMESTAMP", mode="REQUIRED"),
+                bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED")
+            ]
+            
+            # Create table
+            table = bigquery.Table(categories_table, schema=schema)
+            self.client.create_table(table)
+            print(f"Created question categories table {categories_table}")
+            
+            # Insert default categories based on the original CSV
+            default_categories = [
+                {
+                    "category_id": 1,
+                    "question_type": "KPI Extraction",
+                    "description": "These questions request a single KPI value for a specific time range or location.",
+                    "example": "What were perfect orders for Purfleet last week",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 2,
+                    "question_type": "Comparitive Analysis",
+                    "description": "These involve comparison between time periods, locations, or categories.",
+                    "example": "Compare last week ATP with last to last week",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 3, 
+                    "question_type": "Trend Analysis",
+                    "description": "These ask for patterns and trends over time.",
+                    "example": "Show me the trend of orders over the last 6 months? What are the peak ATP months in 2024",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 4,
+                    "question_type": "Forecasting",
+                    "description": "These ask for future trends, requiring predictive modeling via BigQuery ML",
+                    "example": "Will orders per week exceed 600000 next year?",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 5,
+                    "question_type": "Anamoly Detection",
+                    "description": "Users want to understand reasons behind KPI fluctuations.",
+                    "example": "Why did ATP drop in January 2025",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 6,
+                    "question_type": "Operational efficiency",
+                    "description": "Users want performance insights beyond just KPI values",
+                    "example": "Which CFC had highest Perfect order values?",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 7,
+                    "question_type": "Constrained Based Optimization",
+                    "description": "Users need optimal actions based on constraints",
+                    "example": "How should I allocate inventory across warehouses? What's the best way to reduce delivery delays?",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 8,
+                    "question_type": "Exception Handling and Alert",
+                    "description": "Users need for threshold-based monitoring.",
+                    "example": "Alert me if perfect orders drops below 83%. Are there any KPI anamolies today",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 9,
+                    "question_type": "Metadata and Schema",
+                    "description": "Users asks about data structure or ai chatbot capabilities instead of KPI values.",
+                    "example": "What KPIs can I query? Which locations are available in the database?",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 10,
+                    "question_type": "Unsupported/Random Questions",
+                    "description": "Questions that don't fit the system's purpose.",
+                    "example": "Who is the CEO of Tesla? Tell me a joke.",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 11, 
+                    "question_type": "Ambiguous Questions",
+                    "description": "Questions with incomplete information, unclear User Intent",
+                    "example": "Show me last week's report. (Report of what?) How did we do in Q4? (What KPI?)",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 12,
+                    "question_type": "Multi-Intent Questions",
+                    "description": "User combines two category of questions",
+                    "example": "Compare last week's orders with last month and predict next week's trend.",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 13,
+                    "question_type": "KPI Constraints & Unknown KPIs",
+                    "description": "Users might request a derived KPI that isn't stored but can be computed.",
+                    "example": "Find profit margin for last quarter. (What if 'profit margin' isn't stored as a KPI?)",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 14,
+                    "question_type": "Nested or Multi-Step",
+                    "description": "User questions that require multiple dependent steps",
+                    "example": "Get last month's revenue, then compare it with last year's same month and show percentage growth.",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 15, 
+                    "question_type": "Data Availability Issues",
+                    "description": "User may ask about kpi, cfc, spoke or timeperiod which doesn't exist",
+                    "example": "Find customer churn rate (but we don't store churn data).",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 16,
+                    "question_type": "Unsupported NLP Constructs",
+                    "description": "Complex Language patterns that may be difficult to parse",
+                    "example": "Could you kindly tell me the average sales for Q1? Between London and Paris, which city sold more units last quarter?",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 17,
+                    "question_type": "Action-Based Questions",
+                    "description": "Users might request actions rather than just data.",
+                    "example": "Email me last month's sales report. Generate PowerPoint from these insights.",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 18,
+                    "question_type": "Small Talk",
+                    "description": "Casual conversation",
+                    "example": "How are you today?",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                },
+                {
+                    "category_id": 19,
+                    "question_type": "Feedback",
+                    "description": "User provides comment on their experience",
+                    "example": "You are doing a great job. This wasn't helpful at all",
+                    "created_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+            ]
+            
+            # Insert each category
+            for category in default_categories:
+                self.client.insert_rows_json(categories_table, [category])
+            
+            print(f"Inserted {len(default_categories)} default question categories")
+        except Exception as e:
+            print(f"Error creating question categories table: {str(e)}")
+            raise
+
+    def _ensure_question_categories_table_exists(self):
+        """Ensure the question_categories table exists, create it if it doesn't"""
+        try:
+            # Check if categories table exists
+            categories_table_id = self.tables["question_categories"]
+            table_exists = False
+            
+            try:
+                self.client.get_table(categories_table_id)
+                print(f"Question categories table {categories_table_id} exists")
+                table_exists = True
+            except Exception as e:
+                print(f"Question categories table {categories_table_id} does not exist, creating it...")
+                table_exists = False
+            
+            if not table_exists:
+                # Create the table with default categories
+                self._create_default_question_categories_table()
+            
+        except Exception as e:
+            print(f"Error ensuring question categories table exists: {str(e)}")
+            raise
 
      

@@ -16,6 +16,13 @@ from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 import uuid
 from datetime import datetime
+import time
+import traceback
+import logging
+
+# Set up logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # Import original components
 from bigquery_client import BigQueryClient
@@ -24,18 +31,28 @@ from query_processor import QueryProcessor
 from query_agent import QueryAgent
 from response_agent import ResponseAgent
 from session_manager_v2 import SessionManagerV2
+from question_classifier import QuestionClassifier
 
 # Import MCP components
 from mcp import (
     QueryData,
     Context,
+    MCPQuestionClassifier,
     MCPQueryProcessor,
-    MCPQueryAgent,
     MCPQueryExecutor,
     MCPResponseGenerator,
     MCPSessionManager,
     MCPQueryFlowOrchestrator
 )
+from mcp.processors import (
+    MCPQuestionClassifier, 
+    MCPQueryProcessor,
+    MCPQueryExecutor,
+    MCPResponseGenerator,
+    MCPSessionManager
+)
+from mcp.router import MCPRouter
+from mcp.protocol import ContextMetadata
 
 # Load environment variables
 load_dotenv()
@@ -53,6 +70,12 @@ class QueryResponse(BaseModel):
     summary: Optional[str] = None
     status: str = "processing"
 
+# Additional model for the process endpoint
+class ProcessRequest(BaseModel):
+    question: str
+    user_id: str = "anonymous"
+    session_id: Optional[str] = None
+
 # Initialize components
 bigquery_client = BigQueryClient()
 gemini_client = GeminiClient()
@@ -60,22 +83,85 @@ query_processor = QueryProcessor(gemini_client, bigquery_client)
 query_agent = QueryAgent(gemini_client)
 response_agent = ResponseAgent(gemini_client)
 session_manager = SessionManagerV2()
+question_classifier = QuestionClassifier()
 
 # Initialize MCP wrappers
+mcp_question_classifier = MCPQuestionClassifier(question_classifier)
 mcp_query_processor = MCPQueryProcessor(query_processor)
-mcp_query_agent = MCPQueryAgent(query_agent)
 mcp_query_executor = MCPQueryExecutor(bigquery_client)
 mcp_response_generator = MCPResponseGenerator(response_agent)
 mcp_session_manager = MCPSessionManager(session_manager)
 
 # Create the flow orchestrator
 orchestrator = MCPQueryFlowOrchestrator(
+    mcp_question_classifier,
     mcp_query_processor,
-    mcp_query_agent,
+    None,  # Set to None since MCPQueryAgent is not defined
     mcp_query_executor,
     mcp_response_generator,
     mcp_session_manager
 )
+
+# Initialize components if not already initialized
+mcp_components = None
+
+def initialize_mcp():
+    """Initialize MCP components"""
+    try:
+        logger.info("Initializing MCP components")
+        bigquery_client = BigQueryClient()
+        logger.info("BigQueryClient initialized")
+        
+        gemini_client = GeminiClient()
+        logger.info("GeminiClient initialized")
+        
+        query_processor = QueryProcessor(gemini_client, bigquery_client)
+        logger.info("QueryProcessor initialized")
+        
+        response_agent = ResponseAgent(gemini_client)
+        logger.info("ResponseAgent initialized")
+        
+        session_manager = SessionManagerV2()
+        logger.info("SessionManagerV2 initialized")
+        
+        # Initialize question classifier
+        question_classifier = QuestionClassifier()
+        logger.info("QuestionClassifier initialized")
+        
+        # Create MCP Components
+        mcp_classifier = MCPQuestionClassifier(question_classifier)
+        logger.info("MCPQuestionClassifier initialized")
+        
+        mcp_query_processor = MCPQueryProcessor(query_processor)
+        logger.info("MCPQueryProcessor initialized")
+        
+        mcp_executor = MCPQueryExecutor(bigquery_client)
+        logger.info("MCPQueryExecutor initialized")
+        
+        mcp_response_generator = MCPResponseGenerator(response_agent)
+        logger.info("MCPResponseGenerator initialized")
+        
+        mcp_session_manager = MCPSessionManager(session_manager)
+        logger.info("MCPSessionManager initialized")
+        
+        # Create MCP Router
+        mcp_router = MCPRouter()
+        logger.info("MCPRouter initialized")
+        
+        components = {
+            "mcp_classifier": mcp_classifier,
+            "mcp_query_processor": mcp_query_processor,
+            "mcp_executor": mcp_executor,
+            "mcp_response_generator": mcp_response_generator,
+            "mcp_session_manager": mcp_session_manager,
+            "mcp_router": mcp_router
+        }
+        logger.info(f"MCP components initialized: {list(components.keys())}")
+        return components
+    except Exception as e:
+        logger.error(f"Error initializing MCP components: {str(e)}")
+        traceback.print_exc()
+        raise
 
 # Background task to process queries using the MCP flow
 async def process_query_task(user_id: str, question: str, session_id: str):
@@ -86,7 +172,7 @@ async def process_query_task(user_id: str, question: str, session_id: str):
             user_id=user_id,
             question=question,
             session_id=session_id,
-            created_at=datetime.utcnow()
+            created_at=datetime.now()
         )
         
         # Process the query through the MCP flow
@@ -129,6 +215,20 @@ async def submit_query(request: QueryRequest, background_tasks: BackgroundTasks)
 async def get_query_status(session_id: str):
     """Get the status of a query"""
     try:
+        # First try to get the session from the router's cache
+        if 'mcp_components' in globals() and mcp_components is not None:
+            mcp_router = mcp_components.get('mcp_router')
+            if mcp_router:
+                cached_session = mcp_router.get_cached_session(session_id)
+                if cached_session:
+                    logger.info(f"Retrieved session {session_id} from cache")
+                    return QueryResponse(
+                        session_id=session_id,
+                        summary=cached_session.get("summary"),
+                        status=cached_session.get("status", "processing")
+                    )
+        
+        # If not in cache, try to get from BigQuery
         # Get the session from BigQuery
         session = session_manager.get_session(session_id)
         if not session:
@@ -145,6 +245,8 @@ async def get_query_status(session_id: str):
         )
     except Exception as e:
         # Handle any errors during status retrieval
+        logger.error(f"Error getting query status: {str(e)}")
+        traceback.print_exc()
         return JSONResponse(
             status_code=500,
             content={"error": f"Error getting query status: {str(e)}"}
@@ -168,6 +270,125 @@ async def root():
             "/health"
         ]
     }
+
+@app.post("/process")
+async def process(request: ProcessRequest):
+    """Process a question and return a response."""
+    session_id = None
+    try:
+        # Validate request data
+        if not request.question:
+            return {"error": "Missing required field: question"}
+        
+        # Initialize components if needed
+        global mcp_components
+        if mcp_components is None:
+            logger.info("Initializing MCP components")
+            mcp_components = initialize_mcp()
+            
+        # Extract components - use correct component names from initialize_mcp
+        mcp_question_classifier = mcp_components.get('mcp_classifier')
+        if mcp_question_classifier is None:
+            logger.error("mcp_classifier component is missing")
+            return {"error": "Server configuration error: mcp_classifier not found"}
+            
+        mcp_router = mcp_components.get('mcp_router')
+        if mcp_router is None:
+            logger.error("mcp_router component is missing")
+            return {"error": "Server configuration error: mcp_router not found"}
+            
+        mcp_session_manager = mcp_components.get('mcp_session_manager')
+        if mcp_session_manager is None:
+            logger.error("mcp_session_manager component is missing")
+            return {"error": "Server configuration error: mcp_session_manager not found"}
+        
+        logger.info(f"Processing question: {request.question}")
+        logger.info(f"Using components: {list(mcp_components.keys())}")
+        
+        # Create or use session_id
+        session_id = request.session_id if request.session_id else str(uuid.uuid4())
+        user_id = request.user_id if request.user_id else "anonymous"
+        
+        logger.info(f"Session ID: {session_id}")
+        logger.info(f"User ID: {user_id}")
+        
+        # Create query data with required fields
+        query_data = QueryData(
+            user_id=user_id,
+            question=request.question,
+            session_id=session_id,
+            created_at=datetime.now()
+        )
+        
+        logger.info(f"Created QueryData: {query_data}")
+        
+        # Create metadata for context
+        metadata = ContextMetadata(
+            context_id=str(uuid.uuid4()),
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            component="mcp_server",
+            operation="process_question",
+            status="pending",
+            session_id=session_id
+        )
+        
+        # Create context for query
+        query_context = Context(data=query_data, metadata=metadata)
+        
+        # Classify question
+        logger.info("Classifying question")
+        start_time = time.time()
+        classification_context = mcp_question_classifier.process(query_context)
+        
+        # Route based on classification
+        question_type = classification_context.data.question_type
+        confidence = classification_context.data.confidence
+        
+        logger.info(f"Question classified as {question_type} with confidence {confidence}")
+        
+        # Store classification in context metadata
+        metadata.component = "mcp_router"
+        metadata.operation = "route_question"
+        metadata.updated_at = datetime.now()
+        
+        # Use the router to direct the question based on type
+        logger.info(f"Routing question to appropriate handler for type: {question_type}")
+        
+        # Log session manager details
+        logger.info(f"Session manager type: {type(mcp_session_manager)}")
+        logger.info(f"Session manager has session_manager attribute: {hasattr(mcp_session_manager, 'session_manager')}")
+        if hasattr(mcp_session_manager, 'session_manager'):
+            logger.info(f"Inner session_manager type: {type(mcp_session_manager.session_manager)}")
+        
+        response_context = mcp_router.route(classification_context, session_manager=mcp_session_manager.session_manager)
+        
+        # Extract response data
+        logger.info("Processing response")
+        response_data = response_context.data
+        
+        # Create response with execution time and classification info
+        execution_time = time.time() - start_time
+        response = {
+            "session_id": session_id,
+            "query": request.question,
+            "result": response_data.summary,
+            "execution_time": round(execution_time, 2),
+            "question_type": question_type,
+            "confidence": confidence
+        }
+        
+        # Add additional information if available
+        if hasattr(response_data, 'feedback_data') and response_data.feedback_data:
+            response["feedback_data"] = response_data.feedback_data
+            logger.info(f"Feedback data: {response_data.feedback_data}")
+        
+        logger.info(f"Processing completed in {execution_time:.2f} seconds")
+        return response
+    except Exception as e:
+        logger.error(f"Error processing request: {str(e)}")
+        traceback.print_exc()
+        return {"error": str(e), "session_id": session_id}
 
 if __name__ == "__main__":
     # Run the server

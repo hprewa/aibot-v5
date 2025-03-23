@@ -11,7 +11,7 @@ A system that processes analytical queries using Google BigQuery and Vertex AI (
 - Intelligent summarization of results
 - DSPy-powered Query Agent for structured query generation
 - Model Context Protocol (MCP) for standardized context flow
-- Slack integration for interactive querying
+- Slack App Home integration for dedicated bot window experience
 
 ## Session Management System
 
@@ -44,25 +44,26 @@ The Analytics Bot now implements the Model Context Protocol, a standardized way 
 
 For more details, see [MCP_README.md](MCP_README.md).
 
-## Slack Integration
+## Slack App Home Integration
 
-The Analytics Bot includes a Slack integration that allows users to interact with the bot directly from Slack:
+The Analytics Bot includes a Slack App Home integration that provides a dedicated bot window experience directly within Slack:
 
 - **MCP-powered**: Uses the Model Context Protocol for robust, typed context flow
+- **Private Conversations**: Each user has their own private conversation space
+- **Per-User History**: Complete conversation history displayed in the App Home tab
 - **Status Indicators**: Uses Slack reactions to indicate processing status
-- **Threaded Replies**: Responses are posted as threaded replies to keep channels clean
-- **Real-time Processing**: Messages are processed in real-time with status updates
+- **Threaded Replies**: Responses are organized in threads for better context tracking
+- **Native Slack Experience**: No need to leave Slack or learn a new interface
 
 ### Slack App Configuration
 
 1. Create a Slack app at https://api.slack.com/apps
 2. Under "OAuth & Permissions", add the following scopes:
    - `chat:write` (for sending messages)
-   - `reactions:write` (for adding/removing reactions)
-   - `reactions:read` (for checking reactions)
-   - `channels:history` (for reading channel messages)
    - `im:history` (for reading direct messages)
-   - `groups:history` (for reading private channel messages)
+   - `im:write` (for sending direct messages)
+   - `app_home:update` (for updating the App Home tab)
+   - `reactions:write` (for adding/removing reactions)
 
 3. Install the app to your workspace
 
@@ -70,12 +71,17 @@ The Analytics Bot includes a Slack integration that allows users to interact wit
    - Enable events
    - Set the Request URL to your endpoint (e.g., ngrok URL + `/slack/events`)
    - Subscribe to the following events under "Subscribe to bot events":
-     - `message.channels`
+     - `app_home_opened`
      - `message.im`
 
-5. Reinstall the app to your workspace after making changes
+5. Under "App Home":
+   - Enable the Home Tab
+   - Enable the Messages Tab
+   - Check "Allow users to send Slash commands and messages from the messages tab"
 
-For detailed setup instructions, see [README_SLACK_SETUP.md](README_SLACK_SETUP.md).
+6. Reinstall the app to your workspace after making changes
+
+For detailed setup instructions, see [README_SLACK_SETUP.md](README_SLACK_SETUP.md) and [APP_HOME_README.md](APP_HOME_README.md).
 
 ## Prerequisites
 
@@ -130,29 +136,29 @@ Run the MCP-powered FastAPI server:
 python mcp_server.py
 ```
 
-### Option 2: Slack Integration
+### Option 2: Slack App Home Integration
 
-Run the MCP-powered Slack integration:
+Run the MCP-powered Slack App Home integration:
 ```bash
-python run_mcp_slack.py
+python run_mcp_app_home.py
 ```
 
 With ngrok for external access:
 ```bash
-python run_mcp_slack.py --ngrok
+python run_mcp_app_home.py --ngrok
 ```
 
 This will start:
-- The FastAPI-based Slack integration server
+- The FastAPI-based Slack App Home integration server
 - An ngrok tunnel (if --ngrok flag is used) for public access
 
 For Windows users, a PowerShell script is provided:
 ```powershell
 # Run the bot (local only)
-.\run_slack_bot.ps1
+.\run_app_home.ps1
 
 # Run with ngrok tunnel for public access
-.\run_slack_bot.ps1 -ngrok
+.\run_app_home.ps1 -UseNgrok
 ```
 
 ## Project Structure
@@ -163,12 +169,12 @@ The application consists of several components:
   - `mcp/protocol.py`: Core protocol classes
   - `mcp/models.py`: Data models for context objects
   - `mcp/processors.py`: MCP wrappers for original components
-  - `mcp/slack_integration.py`: MCP-compatible Slack integration
+  - `mcp/slack_app_home.py`: MCP-compatible Slack App Home integration
 
 - **Entry Points**:
   - `mcp_server.py`: MCP-powered FastAPI server
-  - `run_mcp_slack.py`: Integrated server with Slack support
-  - `run_slack_bot.ps1`: PowerShell script for running the Slack integration
+  - `run_mcp_app_home.py`: Integrated server with Slack App Home support
+  - `run_app_home.ps1`: PowerShell script for running the Slack App Home integration
 
 - **Original Components** (wrapped by MCP):
   - `bigquery_client.py`: Handles BigQuery interactions
@@ -182,25 +188,16 @@ The application consists of several components:
 - **Documentation**:
   - `README.md`: Main project documentation
   - `README_SLACK_SETUP.md`: Detailed guide for setting up Slack integration
+  - `APP_HOME_README.md`: Documentation for the Slack App Home integration
   - `MCP_README.md`: Documentation for the MCP implementation
   - `QUERY_AGENT_README.md`: Documentation for the Query Agent system
   - `SESSIONS_README.md`: Documentation for the Session Management system
 
 - **Utilities**:
-  - `test_slack.py`: Tool for testing Slack API connectivity
+  - `get_ngrok_url.py`: Script to get the current ngrok URL
   - `ngrok.exe`: Tunnel tool for exposing local server to the internet
 
 ## Maintenance and Testing
-
-### Testing Slack Integration
-
-To test Slack API connectivity before running the full application:
-
-```bash
-python test_slack.py
-```
-
-This script will verify your Slack credentials and permissions.
 
 ### Updating Bot Permissions
 

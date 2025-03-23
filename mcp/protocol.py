@@ -20,59 +20,96 @@ class DateTimeEncoder(json.JSONEncoder):
         return super().default(obj)
 
 class ContextMetadata(BaseModel):
-    """Metadata for tracking context transformations"""
+    """Metadata for the Context class, containing information about the context flow"""
     context_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     parent_id: Optional[str] = None
     created_at: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
     updated_at: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
     component: str
     operation: str
-    status: str = "created"
-    error: Optional[str] = None
+    status: str = "pending"  # pending, success, error
+    error_message: Optional[str] = None
+    session_id: Optional[str] = None
+    user_id: Optional[str] = None  # Added for user identification
+    
+    @property
+    def has_error(self) -> bool:
+        """Check if the context has an error"""
+        return self.status == "error"
 
 T = TypeVar('T', bound=BaseModel)
 
-class Context(BaseModel, Generic[T]):
-    """Base context class that wraps data with metadata"""
+class Context(Generic[T]):
+    """
+    Context class for the MCP protocol, containing data and metadata.
+    
+    This class is used to pass data between components in the MCP protocol.
+    It contains both the data being processed and metadata about the processing.
+    """
+    
     data: T
     metadata: ContextMetadata
     
+    def __init__(self, data: T, metadata: ContextMetadata):
+        """
+        Initialize a new Context object.
+        
+        Args:
+            data: The data for this context
+            metadata: The metadata for this context
+        """
+        self.data = data
+        self.metadata = metadata
+    
     @classmethod
-    def create(cls, data: T, component: str, operation: str, parent_id: Optional[str] = None) -> 'Context[T]':
-        """Create a new context with the given data"""
+    def create(cls, data: T, component: str, operation: str, parent_id: Optional[str] = None, 
+              session_id: Optional[str] = None) -> 'Context[T]':
+        """
+        Create a new Context object with generated metadata.
+        
+        Args:
+            data: The data for this context
+            component: The component that created this context
+            operation: The operation that created this context
+            parent_id: The parent context ID, if any
+            session_id: The session ID, if any
+            
+        Returns:
+            A new Context object
+        """
         metadata = ContextMetadata(
             component=component,
             operation=operation,
-            parent_id=parent_id
+            parent_id=parent_id,
+            session_id=session_id,
+            status="pending"
         )
-        return cls(data=data, metadata=metadata)
+        
+        return cls(data, metadata)
     
-    def update(self, data: T = None, **kwargs) -> 'Context[T]':
-        """Update the context with new data and metadata"""
-        # Create a new context object to maintain immutability
-        new_data = data if data is not None else self.data
+    def update(self, **kwargs) -> 'Context[T]':
+        """
+        Update the metadata of this context.
         
-        # Create new metadata with the parent ID set to the current context ID
-        new_metadata = ContextMetadata(
-            context_id=str(uuid.uuid4()),
-            parent_id=self.metadata.context_id,
-            created_at=datetime.datetime.utcnow(),
-            updated_at=datetime.datetime.utcnow(),
-            component=kwargs.get('component', self.metadata.component),
-            operation=kwargs.get('operation', self.metadata.operation),
-            status=kwargs.get('status', "updated")
-        )
+        Args:
+            **kwargs: The metadata fields to update
+            
+        Returns:
+            The updated context
+        """
+        # Create a copy of the metadata and update it
+        metadata_dict = self.metadata.dict()
+        metadata_dict.update(kwargs)
+        metadata_dict["updated_at"] = datetime.datetime.utcnow()
         
-        # Apply any additional metadata updates
-        for key, value in kwargs.items():
-            if hasattr(new_metadata, key):
-                setattr(new_metadata, key, value)
+        # Create a new metadata object with the updated fields
+        self.metadata = ContextMetadata(**metadata_dict)
         
-        return Context(data=new_data, metadata=new_metadata)
+        return self
     
     def error(self, error_message: str) -> 'Context[T]':
         """Mark context as errored with an error message"""
-        return self.update(status="error", error=error_message)
+        return self.update(status="error", error_message=error_message)
     
     def success(self) -> 'Context[T]':
         """Mark context as successful"""

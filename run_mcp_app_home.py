@@ -1,8 +1,8 @@
 """
-Run script for the MCP-powered Analytics Bot with Slack integration.
+Run script for the MCP-powered Analytics Bot with Slack App Home integration.
 
 This script initializes all components, creates the MCP orchestrator,
-and starts the Slack integration server with FastAPI for HTTP Events API support.
+and starts the Slack App Home integration server with FastAPI for HTTP Events API support.
 """
 
 import os
@@ -16,6 +16,7 @@ from datetime import datetime
 
 # Import MCP components
 from mcp import (
+    MCPQuestionClassifier,
     MCPQueryProcessor,
     MCPQueryAgent,
     MCPQueryExecutor,
@@ -23,6 +24,7 @@ from mcp import (
     MCPSessionManager,
     MCPQueryFlowOrchestrator
 )
+from mcp.router import MCPRouter
 
 # Import original components
 from bigquery_client import BigQueryClient
@@ -31,9 +33,10 @@ from query_processor import QueryProcessor
 from query_agent import QueryAgent
 from response_agent import ResponseAgent
 from session_manager_v2 import SessionManagerV2
+from question_classifier import QuestionClassifier
 
-# Import Slack integration
-from mcp.slack_integration import MCPSlackIntegration
+# Import Slack App Home integration
+from mcp.slack_app_home import MCPSlackAppHome
 
 def setup_ngrok(port=8000):
     """Set up ngrok if available"""
@@ -65,7 +68,7 @@ def setup_ngrok(port=8000):
                 print(f"📡 Public URL: {public_url}")
                 print(f"🔗 Slack Events URL: {public_url}/slack/events")
                 print("\nUse this URL in your Slack app's Event Subscriptions settings.")
-                print("Remember to subscribe to the 'message.channels' and 'message.im' events.")
+                print("Remember to subscribe to the 'app_home_opened' and 'message.im' events.")
             else:
                 print("No active ngrok tunnels found.")
         except Exception as e:
@@ -87,29 +90,38 @@ def initialize_components():
     query_agent = QueryAgent(gemini_client)
     response_agent = ResponseAgent(gemini_client)
     session_manager = SessionManagerV2()
+    question_classifier = QuestionClassifier()
     
     # Initialize MCP wrappers
+    mcp_question_classifier = MCPQuestionClassifier(question_classifier)
     mcp_query_processor = MCPQueryProcessor(query_processor)
     mcp_query_agent = MCPQueryAgent(query_agent)
     mcp_query_executor = MCPQueryExecutor(bigquery_client)
     mcp_response_generator = MCPResponseGenerator(response_agent)
     mcp_session_manager = MCPSessionManager(session_manager)
     
+    # Create router
+    mcp_router = MCPRouter()
+    
     # Create the flow orchestrator
     orchestrator = MCPQueryFlowOrchestrator(
-        mcp_query_processor,
-        mcp_query_agent,
-        mcp_query_executor,
-        mcp_response_generator,
-        mcp_session_manager
+        question_classifier=mcp_question_classifier,
+        query_processor=mcp_query_processor,
+        query_agent=mcp_query_agent,
+        query_executor=mcp_query_executor,
+        response_generator=mcp_response_generator,
+        session_manager=mcp_session_manager
     )
+    
+    # Add router to orchestrator
+    orchestrator.router = mcp_router
     
     return orchestrator
 
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="Run the MCP-powered Analytics Bot with Slack integration"
+        description="Run the MCP-powered Analytics Bot with Slack App Home integration"
     )
     parser.add_argument(
         "--port", 
@@ -126,7 +138,7 @@ def parse_args():
     return parser.parse_args()
 
 def main():
-    """Main function to run the MCP-powered Analytics Bot"""
+    """Main function to run the MCP-powered Analytics Bot with App Home"""
     # Parse command line arguments
     args = parse_args()
     
@@ -137,9 +149,9 @@ def main():
     port = args.port
     
     # Print startup banner
-    print("\n" + "=" * 60)
-    print(" MCP-POWERED ANALYTICS BOT WITH SLACK INTEGRATION ".center(60, "="))
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print(" MCP-POWERED ANALYTICS BOT WITH SLACK APP HOME INTEGRATION ".center(70, "="))
+    print("=" * 70)
     
     # Initialize components
     orchestrator = initialize_components()
@@ -150,9 +162,9 @@ def main():
         ngrok_process = setup_ngrok(port)
     
     try:
-        # Create and start Slack integration
-        slack_integration = MCPSlackIntegration(orchestrator)
-        slack_integration.start(port=port)
+        # Create and start Slack App Home integration
+        app_home = MCPSlackAppHome(orchestrator)
+        app_home.start(port=port)
         
     except KeyboardInterrupt:
         print("\n\n👋 Shutting down...")

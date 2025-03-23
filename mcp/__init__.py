@@ -16,6 +16,7 @@ from mcp.protocol import (
 
 from mcp.models import (
     QueryData,
+    ClassificationData,
     ConstraintData,
     StrategyData,
     QueryExecutionData,
@@ -25,6 +26,7 @@ from mcp.models import (
 )
 
 from mcp.processors import (
+    MCPQuestionClassifier,
     MCPQueryProcessor,
     MCPQueryAgent,
     MCPQueryExecutor,
@@ -32,6 +34,12 @@ from mcp.processors import (
     MCPSessionManager,
     MCPQueryFlowOrchestrator
 )
+
+# Integrations
+try:
+    from mcp.slack_app_home import MCPSlackAppHome
+except ImportError:
+    MCPSlackAppHome = None
 
 __all__ = [
     # Protocol classes
@@ -44,6 +52,7 @@ __all__ = [
     
     # Model classes
     'QueryData',
+    'ClassificationData',
     'ConstraintData',
     'StrategyData',
     'QueryExecutionData',
@@ -52,10 +61,14 @@ __all__ = [
     'ToolCallData',
     
     # Processor classes
+    'MCPQuestionClassifier',
     'MCPQueryProcessor',
     'MCPQueryAgent',
     'MCPQueryExecutor',
     'MCPResponseGenerator',
     'MCPSessionManager',
-    'MCPQueryFlowOrchestrator'
+    'MCPQueryFlowOrchestrator',
+    
+    # Integrations
+    'MCPSlackAppHome'
 ] 

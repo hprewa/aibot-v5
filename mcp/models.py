@@ -10,12 +10,23 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime
 from pydantic import BaseModel, Field
 import uuid
+import json
 
 class QueryData(BaseModel):
     """Data model for the initial query"""
     user_id: str
     question: str
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class ClassificationData(BaseModel):
+    """Data model for the question classification"""
+    question: str
+    question_type: str
+    confidence: float
+    requires_sql: bool = True
+    requires_summary: bool = True
+    classification_metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class ConstraintData(BaseModel):
@@ -57,41 +68,75 @@ class QueryExecutionData(BaseModel):
     execution_end: Optional[datetime] = None
     
 class ResponseData(BaseModel):
-    """Data model for the generated response"""
+    """Data model for the response"""
+    query: str
     summary: Optional[str] = None
-    status: str = "processing"
-    error: Optional[str] = None
-    generated_at: Optional[datetime] = None
+    sql: Optional[str] = None
+    results: Optional[Dict[str, Any]] = None
+    execution_time: float = 0.0
+    feedback_data: Optional[Dict[str, Any]] = None  # Added for storing feedback
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class SessionData(BaseModel):
-    """Data model for the complete session"""
+    """Data model for the session"""
     session_id: str
     user_id: str
     question: str
-    constraints: Optional[ConstraintData] = None
-    strategy: Optional[StrategyData] = None
-    execution: Optional[QueryExecutionData] = None
-    response: Optional[ResponseData] = None
+    slack_channel: Optional[str] = None
+    constraints: Optional[Dict[str, Any]] = None
+    classification: Optional[ClassificationData] = None
+    response_plan: Optional[Dict[str, Any]] = None
+    strategy: Optional[Dict[str, Any]] = None
+    execution: Optional[Dict[str, Any]] = None
+    response: Optional[Dict[str, Any]] = None
+    feedback: Optional[List[Dict[str, Any]]] = Field(default_factory=list)  # Added for storing feedback
+    results: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
     status: str = "pending"
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
-    slack_channel: Optional[str] = None
-    error: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary format for BigQuery storage"""
+        return {
+            "session_id": self.session_id,
+            "user_id": self.user_id,
+            "question": self.question,
+            "slack_channel": self.slack_channel,
+            "constraints": json.dumps(self.constraints, cls=DateTimeEncoder) if self.constraints else None,
+            "classification": json.dumps(self.classification.dict() if self.classification else None, cls=DateTimeEncoder),
+            "question_type": self.classification.question_type if self.classification else None,
+            "requires_sql": self.classification.requires_sql if self.classification else True,
+            "requires_summary": self.classification.requires_summary if self.classification else True,
+            "response_plan": json.dumps(self.response_plan, cls=DateTimeEncoder) if self.response_plan else None,
+            "strategy": json.dumps(self.strategy, cls=DateTimeEncoder) if self.strategy else None,
+            "execution": json.dumps(self.execution, cls=DateTimeEncoder) if self.execution else None,
+            "response": json.dumps(self.response, cls=DateTimeEncoder) if self.response else None,
+            "feedback": json.dumps(self.feedback, cls=DateTimeEncoder) if self.feedback else None,  # Added for storing feedback
+            "results": json.dumps(self.results, cls=DateTimeEncoder) if self.results else None,
+            "status": self.status,
+            "error": self.error,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at
+        }
 
     def to_bq_format(self) -> Dict[str, Any]:
         """Convert the session data to a format suitable for BigQuery"""
         # This method helps with serializing complex objects for BigQuery
         from mcp.protocol import DateTimeEncoder
-        import json
         
         # Create a dictionary that can be serialized to JSON
         bq_data = {
             "session_id": self.session_id,
             "user_id": self.user_id,
             "question": self.question,
-            "constraints": json.dumps(self.constraints.dict() if self.constraints else None, cls=DateTimeEncoder),
-            "response_plan": json.dumps(self.constraints.response_plan if self.constraints else None, cls=DateTimeEncoder),
-            "strategy": json.dumps(self.strategy.raw_strategy if self.strategy else None, cls=DateTimeEncoder),
+            "classification": json.dumps(self.classification.dict() if self.classification else None, cls=DateTimeEncoder),
+            "question_type": self.classification.question_type if self.classification else None,
+            "requires_sql": self.classification.requires_sql if self.classification else True,
+            "requires_summary": self.classification.requires_summary if self.classification else True,
+            "constraints": json.dumps(self.constraints if self.constraints else None, cls=DateTimeEncoder),
+            "response_plan": json.dumps(self.response_plan if self.response_plan else None, cls=DateTimeEncoder),
+            "strategy": json.dumps(self.strategy if self.strategy else None, cls=DateTimeEncoder),
             "summary": self.response.summary if self.response else None,
             "status": self.status,
             "tool_calls": [json.dumps(tc.dict(), cls=DateTimeEncoder) for tc in 
