@@ -1,7 +1,13 @@
+"""Location Hierarchy Manager for handling location data and generating SQL conditions. 
+Manages location levels (Network, CFC, Spoke) and facilitates location-based 
+query filtering in the Analytics Bot."""
+
 from google.cloud import bigquery
 from typing import Dict, List, Set, Optional
 import pandas as pd
 from functools import lru_cache
+
+
 
 class LocationHierarchyManager:
     """Manages location hierarchy and SQL generation for different aggregation levels"""

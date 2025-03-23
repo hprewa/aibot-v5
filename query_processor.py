@@ -1,9 +1,12 @@
+"""Query Processor for transforming natural language questions into actionable constraints and strategies. Integrates with Gemini and BigQuery to extract constraints, generate strategies, and manage SQL query templates in the Analytics Bot."""
 from typing import Dict, List, Optional, Any
 from gemini_client import GeminiClient
 from bigquery_client import BigQueryClient
 import json
 from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta, MO, SU
 import os
+import traceback
 
 class QueryProcessor:
     def __init__(self, gemini_client: GeminiClient, bigquery_client: BigQueryClient):
@@ -74,6 +77,14 @@ class QueryProcessor:
     def extract_constraints(self, question: str) -> Dict[str, Any]:
         """Extract constraints using Gemini Flash thinking 2.0"""
         current_date = datetime.now()
+
+        # Calculate last week's date range
+        last_week_start = (current_date + relativedelta(weekday=MO(-2))).strftime('%Y-%m-%d')
+        last_week_end = (current_date + relativedelta(weekday=SU(-2))).strftime('%Y-%m-%d') if current_date.weekday() == 6 else (current_date + relativedelta(weekday=SU(-1))).strftime('%Y-%m-%d')
+        
+        # Calculate past month's date range
+        past_month_start = (current_date + relativedelta(day=1, month=current_date.month-1)).strftime('%Y-%m-%d')
+        past_month_end = ((current_date  + relativedelta(day=1, month=current_date.month )) - timedelta(days=1)).strftime('%Y-%m-%d')
         
         # First, get table schemas for context
         schema_context = self._get_schema_context()
@@ -92,11 +103,15 @@ Location hierarchy rules:
 
 Time-related rules:
 1. Time filters (for WHERE clause):
-   - "last week" = {(current_date - timedelta(days=7)).strftime('%Y-%m-%d')} to {current_date.strftime('%Y-%m-%d')}
-   - "past month" = {(current_date - timedelta(days=30)).strftime('%Y-%m-%d')} to {current_date.strftime('%Y-%m-%d')}
+   - "last week" = {last_week_start} to {last_week_end}
+   - "past month" = {past_month_start} to {past_month_end}
    - "yesterday" = {(current_date - timedelta(days=1)).strftime('%Y-%m-%d')}
    - "this quarter" = {(current_date - timedelta(days=90)).strftime('%Y-%m-%d')} to {current_date.strftime('%Y-%m-%d')}
-
+   - "last month" = {past_month_start} to {past_month_end}
+   - "last year" = {(current_date - timedelta(days=365)).strftime('%Y-%m-%d')} to {current_date.strftime('%Y-%m-%d')}
+   - "this year" = {(current_date - timedelta(days=365)).strftime('%Y-%m-%d')} to {current_date.strftime('%Y-%m-%d')}
+   - "next month" = {(current_date + relativedelta(day=1, month=current_date.month+1)).strftime('%Y-%m-%d')} to {(current_date + relativedelta(day=1, month=current_date.month+1)).strftime('%Y-%m-%d')}
+   - "next year" = {(current_date + relativedelta(day=1, month=current_date.month+1)).strftime('%Y-%m-%d')} to {(current_date + relativedelta(day=1, month=current_date.month+1)).strftime('%Y-%m-%d')}
 2. Time aggregation (for GROUP BY):
    - If not explicitly specified, default to "Daily"
    - Valid values: "Hourly", "Daily", "Weekly", "Monthly", "Quarterly", "Yearly"
@@ -467,4 +482,51 @@ Return ONLY the SQL query, no explanation.
 """
         
         response = self.gemini_client.generate_content(prompt)
-        return response if response else "SELECT 1 -- Error generating SQL query" 
+        return response if response else "SELECT 1 -- Error generating SQL query"
+
+    def update_session(self, session_id: str, updates: Dict[str, Any]) -> None:
+        try:
+            print(f"Starting update_session for {session_id} with updates: {list(updates.keys())}")
+            
+            # Get the current session data
+            current_session = self.get_session(session_id)
+            if not current_session:
+                print(f"ERROR: Session {session_id} not found")
+                raise ValueError(f"Session {session_id} not found")
+            
+            print(f"Retrieved current session: {session_id}")
+            
+            # Create a new session data dictionary with the updated information
+            updated_session = current_session.copy()
+            updated_session.update(updates)
+            
+            # Set the updated_at timestamp
+            updated_session["updated_at"] = datetime.utcnow().isoformat()
+            
+            # Convert complex objects to JSON strings for storage
+            for key, value in list(updated_session.items()):
+                if key in ["constraints", "response_plan", "strategy", "tool_call_results", "results"]:
+                    if value is not None and not isinstance(value, str):
+                        try:
+                            print(f"Serializing {key} of type {type(value)}")
+                            updated_session[key] = json.dumps(value, cls=DateTimeEncoder)
+                            print(f"Successfully serialized {key}")
+                        except Exception as e:
+                            print(f"ERROR serializing {key}: {str(e)}")
+                            traceback.print_exc()
+                            # Store a simplified version
+                            updated_session[key] = json.dumps({"error": f"Failed to serialize: {str(e)}"})
+            
+            # Insert the updated session data as a new row
+            print(f"Inserting updated session {session_id}")
+            
+            # Call the BigQuery client to insert the row
+            insert_result = self.bigquery_client.insert_row(self.table_id, updated_session)
+            if insert_result:
+                print(f"ERROR: Session update insert failed: {insert_result}")
+            else:
+                print(f"Successfully inserted updated session {session_id}")
+            
+        except Exception as e:
+            print(f"CRITICAL ERROR updating session {session_id}: {str(e)}")
+            traceback.print_exc() 

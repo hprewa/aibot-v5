@@ -1,3 +1,7 @@
+"""Gemini Client for interacting with Vertex AI's Gemini model. 
+Provides methods to generate content and utilize AI capabilities 
+for processing queries in the Analytics Bot."""
+
 import os
 import json
 from google.cloud import bigquery
