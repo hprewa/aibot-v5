@@ -27,9 +27,15 @@ class SessionManagerV2:
         # Add sessions table to the BigQuery client's tables dictionary
         self.bigquery_client.tables["sessions"] = self.table_id
 
-    def create_session(self, user_id: str, question: str) -> str:
+    def create_session(self, user_id: str, question: str, session_id: Optional[str] = None) -> str:
         """Create a new session for a user query and store it in BigQuery"""
-        session_id = str(uuid.uuid4())
+        # If no session_id provided, generate a Slack-style thread ID
+        if not session_id:
+            # Generate a Slack-style thread ID (timestamp.thread_id)
+            timestamp = int(datetime.utcnow().timestamp())
+            thread_id = str(int(datetime.utcnow().timestamp() * 1000))[-6:]  # Last 6 digits of millisecond timestamp
+            session_id = f"{timestamp}.{thread_id}"
+        
         current_time = datetime.utcnow().isoformat()
         session_data = {
             "session_id": session_id,
@@ -50,7 +56,7 @@ class SessionManagerV2:
             "updated_at": current_time
         }
         
-        print(f"Creating new session with ID: {session_id}")
+        print(f"Creating new session with ID: {session_id} for user: {user_id} with question: {question}")
         self.bigquery_client.insert_row(self.table_id, session_data)
         return session_id
 
@@ -113,11 +119,32 @@ class SessionManagerV2:
             # Get the current session data
             current_session = self.get_session(session_id)
             if not current_session:
-                raise ValueError(f"Session {session_id} not found")
-                
+                # If session doesn't exist, create it with the provided updates
+                print(f"Session {session_id} not found, creating new session with provided data")
+                try:
+                    # Extract user_id and question from updates
+                    user_id = updates.get("user_id", "anonymous")
+                    question = updates.get("question", "Unknown question")
+                    self.create_session(user_id, question, session_id)
+                    current_session = self.get_session(session_id)
+                except Exception as e:
+                    print(f"Failed to create new session: {str(e)}")
+                    raise ValueError(f"Session {session_id} not found and could not be created")
+            
             # Create a new session data dictionary with the updated information
             updated_session = current_session.copy()
-            updated_session.update(updates)
+            
+            # Filter updates to only include fields that exist in the schema
+            schema_fields = {
+                "session_id", "user_id", "question", "constraints", "response_plan",
+                "strategy", "summary", "status", "tool_calls", "tool_call_status",
+                "tool_call_results", "results", "slack_channel", "error",
+                "created_at", "updated_at"
+            }
+            
+            # Only include fields that exist in the schema
+            filtered_updates = {k: v for k, v in updates.items() if k in schema_fields}
+            updated_session.update(filtered_updates)
             
             # Set the updated_at timestamp
             updated_session["updated_at"] = datetime.utcnow().isoformat()
@@ -134,17 +161,26 @@ class SessionManagerV2:
                             # Store a simplified version that can be serialized
                             updated_session[key] = json.dumps({"error": f"Could not serialize {key}: {str(e)}"})
             
+            # Convert tool_calls to JSON if it's a list
+            if "tool_calls" in updated_session and isinstance(updated_session["tool_calls"], list):
+                updated_session["tool_calls"] = json.dumps(updated_session["tool_calls"], cls=DateTimeEncoder)
+            
             # Convert tool_call_status to JSON if it's a dictionary
             if "tool_call_status" in updated_session and isinstance(updated_session["tool_call_status"], dict):
                 updated_session["tool_call_status"] = json.dumps(updated_session["tool_call_status"], cls=DateTimeEncoder)
-                
+            
+            # Remove any fields that don't exist in the schema
+            for key in list(updated_session.keys()):
+                if key not in schema_fields:
+                    del updated_session[key]
+            
             # Insert the updated session data as a new row
-            print(f"Updating session {session_id} with new record containing updates: {json.dumps(updates, cls=DateTimeEncoder)}")
-            print(f"Full updated session data to be inserted: {json.dumps({k: str(v)[:100] + '...' if isinstance(v, str) and len(str(v)) > 100 else v for k, v in updated_session.items()}, cls=DateTimeEncoder)}")
+            print(f"Updating session {session_id} with new record containing updates: {json.dumps(filtered_updates, cls=DateTimeEncoder)}")
             
             # Call the BigQuery client to insert the row
             insert_result = self.bigquery_client.insert_row(self.table_id, updated_session)
-            print(f"Session update insert result: {insert_result if insert_result else 'Success'}")
+            if insert_result:
+                print(f"Warning: Session update insert returned result: {insert_result}")
             
             # Verify the update by retrieving the latest record
             verification = self.get_session(session_id)
@@ -156,6 +192,8 @@ class SessionManagerV2:
         except Exception as e:
             print(f"Error updating session: {str(e)}")
             traceback.print_exc()
+            # Don't re-raise the exception, just log it
+            # This allows the pipeline to continue even if session updates fail
 
     def update_tool_call_status(self, session_id: str, tool_name: str, status: str, result: Any = None) -> None:
         """
@@ -247,7 +285,7 @@ class SessionManagerV2:
             return []
 
     def get_user_sessions(self, user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get sessions for a specific user, ordered by creation time"""
+        """Get the most recent sessions for a user"""
         query = f"""
             SELECT DISTINCT session_id, user_id, question, status, created_at
             FROM `{self.table_id}`
@@ -299,4 +337,4 @@ class SessionManagerV2:
         """
         # For consistency with the strategy field, we'll store the summary as a string directly
         # BigQuery can handle this as the summary field is defined as STRING in the schema
-        self.update_session(session_id, {"summary": summary}) 
+        self.update_session(session_id, {"summary": summary})

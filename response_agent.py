@@ -8,6 +8,7 @@ a natural language response that answers the user's question.
 import json
 import traceback
 import datetime
+import logging
 from typing import Dict, List, Any, Optional
 from gemini_client import GeminiClient
 
@@ -31,6 +32,7 @@ class ResponseAgent:
             gemini_client: The Gemini client for generating responses
         """
         self.gemini_client = gemini_client
+        self.logger = logging.getLogger(__name__)
         
     def generate_response(self, question: str, results: Dict[str, List[Dict[str, Any]]], 
                           constraints: Optional[Dict[str, Any]] = None) -> str:
@@ -46,38 +48,55 @@ class ResponseAgent:
             A natural language response that answers the user's question
         """
         try:
+            self.logger.info(f"\nGenerating response for question: {question}")
+            self.logger.info(f"Results type: {type(results)}")
+            self.logger.info(f"Results keys: {results.keys() if isinstance(results, dict) else 'Not a dict'}")
+            
             # Ensure results is a dictionary
             if isinstance(results, str):
                 try:
                     results = json.loads(results)
+                    self.logger.info("Successfully parsed results from JSON string")
                 except json.JSONDecodeError:
-                    print(f"Error parsing results JSON: {results[:100]}...")
+                    self.logger.error(f"Error parsing results JSON: {results[:100]}...")
                     traceback.print_exc()
                     results = {}
             
             # Ensure constraints is a dictionary
             if constraints is None:
                 constraints = {}
+                self.logger.info("No constraints provided, using empty dict")
             elif isinstance(constraints, str):
                 try:
                     constraints = json.loads(constraints)
+                    self.logger.info("Successfully parsed constraints from JSON string")
                 except json.JSONDecodeError:
-                    print(f"Error parsing constraints JSON: {constraints[:100]}...")
+                    self.logger.error(f"Error parsing constraints JSON: {constraints[:100]}...")
                     traceback.print_exc()
                     constraints = {}
             
             # Pre-process results to calculate totals and other metrics
+            self.logger.info("Pre-processing results...")
             processed_results = self._preprocess_results(results)
+            self.logger.info(f"Processed results keys: {processed_results.keys()}")
             
             # Create a prompt for the response generation
+            self.logger.info("Creating response prompt...")
             prompt = self._create_response_prompt(question, processed_results, constraints)
             
             # Generate the response
+            self.logger.info("Generating response using Gemini...")
             response = self.gemini_client.generate_content(prompt)
             
+            if not response:
+                self.logger.error("No response generated from Gemini")
+                return "I apologize, but I couldn't generate a response from the data."
+                
+            self.logger.info("Successfully generated response")
             return response
+            
         except Exception as e:
-            print(f"Error generating response: {str(e)}")
+            self.logger.error(f"Error generating response: {str(e)}")
             traceback.print_exc()
             return f"I'm sorry, I encountered an error while generating a response: {str(e)}"
         
@@ -91,11 +110,20 @@ class ResponseAgent:
         Returns:
             Processed results with additional calculated metrics
         """
+        self.logger.info("\nPreprocessing results...")
+        self.logger.info(f"Input results type: {type(results)}")
+        self.logger.info(f"Input results keys: {results.keys() if isinstance(results, dict) else 'Not a dict'}")
+        
         processed_results = results.copy()
         
         # Add summary metrics for each result set
         for result_id, result_data in results.items():
+            self.logger.info(f"\nProcessing result set: {result_id}")
+            self.logger.info(f"Result data type: {type(result_data)}")
+            self.logger.info(f"Result data length: {len(result_data) if isinstance(result_data, list) else 'Not a list'}")
+            
             if not result_data:
+                self.logger.info(f"No data for result set {result_id}")
                 continue
                 
             # Calculate totals for numeric fields
@@ -103,12 +131,19 @@ class ResponseAgent:
             
             # Check if this is a time series with dates and total_orders
             if all(("date" in item and "total_orders" in item) for item in result_data):
+                self.logger.info(f"Found time series data with dates and total_orders in {result_id}")
                 total_orders = sum(item["total_orders"] for item in result_data)
                 summary["total_orders"] = total_orders
+                self.logger.info(f"Calculated total orders: {total_orders}")
                 
                 # Add the summary to the processed results
                 processed_results[f"{result_id}_summary"] = summary
+            else:
+                self.logger.info(f"Data in {result_id} is not a time series with dates and total_orders")
+                self.logger.info(f"Sample row: {result_data[0] if result_data else 'No data'}")
                 
+        self.logger.info("\nFinal processed results:")
+        self.logger.info(f"Keys: {processed_results.keys()}")
         return processed_results
         
     def _create_response_prompt(self, question: str, results: Dict[str, List[Dict[str, Any]]], 
@@ -124,11 +159,26 @@ class ResponseAgent:
         Returns:
             A prompt for the Gemini model
         """
+        self.logger.info("\nCreating response prompt...")
+        self.logger.info(f"Question: {question}")
+        self.logger.info(f"Results type: {type(results)}")
+        self.logger.info(f"Results keys: {results.keys() if isinstance(results, dict) else 'Not a dict'}")
+        
         # Format the results as a string
-        results_str = json.dumps(results, indent=2, cls=DateTimeEncoder)
+        try:
+            results_str = json.dumps(results, indent=2, cls=DateTimeEncoder)
+            self.logger.info(f"Results string length: {len(results_str)}")
+        except Exception as e:
+            self.logger.error(f"Error formatting results: {str(e)}")
+            results_str = "{}"
         
         # Format the constraints as a string
-        constraints_str = json.dumps(constraints, indent=2, cls=DateTimeEncoder) if constraints else "{}"
+        try:
+            constraints_str = json.dumps(constraints, indent=2, cls=DateTimeEncoder) if constraints else "{}"
+            self.logger.info(f"Constraints string length: {len(constraints_str)}")
+        except Exception as e:
+            self.logger.error(f"Error formatting constraints: {str(e)}")
+            constraints_str = "{}"
         
         # Extract summary information for the prompt
         summary_info = ""
@@ -137,6 +187,8 @@ class ResponseAgent:
                 base_key = key.replace("_summary", "")
                 if "total_orders" in value:
                     summary_info += f"\nTotal orders for {base_key}: {value['total_orders']}"
+        
+        self.logger.info(f"Summary info: {summary_info if summary_info else 'No summary information available'}")
         
         # Create the prompt
         prompt = f"""
@@ -166,6 +218,7 @@ Your response should be well-structured and easy to understand, even for users w
 Do not include any JSON, code, or technical details in your response.
 """
         
+        self.logger.info(f"Final prompt length: {len(prompt)}")
         return prompt
         
     def generate_error_response(self, question: str, error: str) -> str:

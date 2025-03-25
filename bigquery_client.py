@@ -11,6 +11,7 @@ from google.api_core import retry
 from datetime import datetime, timedelta
 import pandas as pd
 import uuid
+import traceback
 
 class BigQueryClient:
     """Client for interacting with BigQuery tables"""
@@ -403,11 +404,43 @@ class BigQueryClient:
         query_job = self.client.query(query)
         query_job.result()  # Wait for the job to complete
 
-    def query(self, query: str) -> List[Dict[str, Any]]:
+    def execute_query(self, query: str) -> List[Dict[str, Any]]:
         """Execute a query and return the results as a list of dictionaries"""
-        query_job = self.client.query(query)
-        results = query_job.result()
-        return [dict(row.items()) for row in results]
+        try:
+            print(f"Executing query: {query}")
+            query_job = self.client.query(query)
+            
+            # Wait for the query to complete
+            query_job.result()
+            
+            # Check if there were any errors
+            if query_job.errors:
+                print(f"Query execution errors: {query_job.errors}")
+                return []
+            
+            # Get the results
+            results = list(query_job.result())
+            print(f"Query returned {len(results)} rows")
+            
+            # Convert to list of dictionaries
+            formatted_results = []
+            for row in results:
+                formatted_row = {}
+                for key, value in row.items():
+                    if isinstance(value, datetime):
+                        formatted_row[key] = value.isoformat()
+                    elif hasattr(value, 'isoformat'):  # Handle date objects
+                        formatted_row[key] = value.isoformat()
+                    else:
+                        formatted_row[key] = value
+                formatted_results.append(formatted_row)
+            
+            return formatted_results
+            
+        except Exception as e:
+            print(f"Error executing query: {str(e)}")
+            traceback.print_exc()
+            return []
 
     def _ensure_question_classifications_table_exists(self):
         """Ensure the question_classifications table exists, create it if it doesn't"""

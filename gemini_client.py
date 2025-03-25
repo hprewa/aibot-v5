@@ -37,8 +37,8 @@ class GeminiClient:
             print("\nInitializing Vertex AI with project:", self.project_id)
             
             # Initialize Gemini model
-            self.model = GenerativeModel("gemini-pro")
-            print("\nUsing model: gemini-pro")
+            self.model = GenerativeModel("gemini-2.0-pro-exp-02-05")
+            print("\nUsing model: gemini-2.0-pro-exp-02-05")
             
             # Test the configuration
             self._test_connection()

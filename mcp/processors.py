@@ -11,6 +11,7 @@ import json
 import traceback
 from datetime import datetime
 import uuid
+import logging
 
 from .protocol import Context, ContextProcessor, ContextMetadata
 from .models import (
@@ -205,12 +206,16 @@ class MCPQueryExecutor(ContextProcessor):
     
     def __init__(self, bigquery_client: BigQueryClient):
         self.bigquery_client = bigquery_client
+        self.logger = logging.getLogger(__name__)
     
     def process(self, context: Context[QueryExecutionData]) -> Context[QueryExecutionData]:
         """Execute queries in the execution data"""
         try:
             # Extract the execution data
             execution_data = context.data
+            
+            # Set execution start time
+            execution_data.execution_start = datetime.now()
             
             # Execute each query
             for tool_call in execution_data.tool_calls:
@@ -221,72 +226,118 @@ class MCPQueryExecutor(ContextProcessor):
                 try:
                     # Execute the query
                     if tool_call.sql:
-                        result = self.bigquery_client.client.query(tool_call.sql).to_dataframe()
+                        self.logger.info(f"\nExecuting query for tool call {tool_call.name}:")
+                        self.logger.info(f"SQL: {tool_call.sql}")
                         
-                        # Store the result
-                        execution_data.results[tool_call.result_id] = result.to_dict('records')
+                        # Execute query and get results
+                        results = self.bigquery_client.query(tool_call.sql)
+                        
+                        # Format results for response agent
+                        formatted_results = []
+                        for row in results:
+                            # Convert any datetime objects to ISO format strings
+                            formatted_row = {}
+                            for key, value in row.items():
+                                if isinstance(value, (datetime.date, datetime.datetime)):
+                                    formatted_row[key] = value.isoformat()
+                                else:
+                                    formatted_row[key] = value
+                            formatted_results.append(formatted_row)
+                        
+                        # Store the formatted result
+                        execution_data.results[tool_call.result_id] = formatted_results
+                        
+                        self.logger.info(f"Query returned {len(formatted_results)} rows")
+                        if formatted_results:
+                            self.logger.info(f"First row: {json.dumps(formatted_results[0], indent=2)}")
                         
                         # Update the tool call status
                         tool_call.status = "completed"
-                        tool_call.result = result.to_dict('records')
+                        tool_call.result = formatted_results
                     else:
+                        self.logger.error(f"No SQL query provided for tool call {tool_call.name}")
                         tool_call.status = "failed"
                         tool_call.error = "No SQL query provided"
+                        
                 except Exception as e:
-                    # Update the tool call status
+                    self.logger.error(f"Error executing query for tool call {tool_call.name}: {str(e)}")
                     tool_call.status = "failed"
                     tool_call.error = str(e)
+                    continue
             
-            # Set the execution end time
+            # Set execution end time
             execution_data.execution_end = datetime.now()
             
-            # Return updated context
-            return context.update(
-                data=execution_data,
-                component="QueryExecutor",
-                operation="execute_queries",
-                status="success"
-            )
+            # Log final results
+            self.logger.info("\nFinal execution results:")
+            self.logger.info(f"Number of tool calls: {len(execution_data.tool_calls)}")
+            self.logger.info(f"Results keys: {list(execution_data.results.keys())}")
+            for result_id, result in execution_data.results.items():
+                self.logger.info(f"Result {result_id}: {len(result)} rows")
+                if result:
+                    self.logger.info(f"Sample row: {json.dumps(result[0], indent=2)}")
+            
+            return context
+            
         except Exception as e:
+            self.logger.error(f"Error in MCPQueryExecutor: {str(e)}")
             traceback.print_exc()
-            return context.error(f"Error executing queries: {str(e)}")
+            raise
 
 class MCPResponseGenerator(ContextProcessor):
-    """MCP wrapper for the ResponseAgent"""
+    """MCP processor for generating responses"""
     
     def __init__(self, response_agent: ResponseAgent):
         self.response_agent = response_agent
+        self.logger = logging.getLogger(__name__)
     
-    def process(self, context: Context) -> Context:
-        """Generate a response from query results"""
+    def process(self, context: Context[QueryExecutionData]) -> Context[ResponseData]:
+        """Generate a response from the query results"""
         try:
-            # In a typical implementation, we'd have a more robust way to combine contexts
-            # For simplicity, we'll assume this processor receives a QueryExecutionData context
-            # with results, and the original QueryData context
-            
-            if not isinstance(context.data, QueryExecutionData):
-                return context.error("Expected QueryExecutionData as input")
-            
+            # Extract the execution data
             execution_data = context.data
             
-            # Ideally, we would have the original question from the QueryData context
-            # and the constraints from the ConstraintData context
-            # For this demo, we'll use placeholders
-            original_question = "What is the query for these results?"  # Default fallback
-            constraints = {}
+            # Get the original question from the parent context
+            parent_id = context.metadata.parent_id
+            if not parent_id:
+                raise ValueError("No parent context ID found")
             
-            # Generate response
-            summary = self.response_agent.generate_response(
-                original_question, 
-                execution_data.results, 
-                constraints
+            # Get the original question from the parent context
+            # For now, we'll use a default if we can't get the original
+            question = "What are the results?"  # Default fallback
+            
+            # Get the constraints from the parent context
+            constraints = {}
+            if hasattr(execution_data, 'constraints'):
+                constraints = execution_data.constraints
+            
+            # Generate the response
+            self.logger.info("\nGenerating response...")
+            self.logger.info(f"Question: {question}")
+            self.logger.info(f"Results: {json.dumps(execution_data.results, indent=2)}")
+            self.logger.info(f"Constraints: {json.dumps(constraints, indent=2)}")
+            
+            response_text = self.response_agent.generate_response(
+                question=question,
+                results=execution_data.results,
+                constraints=constraints
             )
+            
+            if not response_text:
+                raise ValueError("No response generated")
+            
+            # Calculate execution time
+            execution_time = 0.0
+            if execution_data.execution_start and execution_data.execution_end:
+                execution_time = (execution_data.execution_end - execution_data.execution_start).total_seconds()
             
             # Create response data
             response_data = ResponseData(
-                summary=summary,
-                status="completed",
-                generated_at=datetime.now()
+                query=question,
+                summary=response_text,
+                results=execution_data.results,
+                execution_time=execution_time,
+                created_at=datetime.now()
             )
             
             # Return updated context
@@ -296,20 +347,11 @@ class MCPResponseGenerator(ContextProcessor):
                 operation="generate_response",
                 parent_id=context.metadata.context_id
             ).success()
-        except Exception as e:
-            traceback.print_exc()
-            response_data = ResponseData(
-                status="failed",
-                error=str(e),
-                generated_at=datetime.now()
-            )
             
-            return Context.create(
-                data=response_data,
-                component="ResponseGenerator",
-                operation="generate_response",
-                parent_id=context.metadata.context_id if context else None
-            ).error(str(e))
+        except Exception as e:
+            self.logger.error(f"Error generating response: {str(e)}")
+            traceback.print_exc()
+            return cast(Context[ResponseData], context.error(f"Error generating response: {str(e)}"))
 
 class MCPSessionManager(ContextProcessor):
     """MCP wrapper for the SessionManager"""

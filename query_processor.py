@@ -76,17 +76,22 @@ class QueryProcessor:
         
     def extract_constraints(self, question: str) -> Dict[str, Any]:
         """Extract constraints using Gemini Flash thinking 2.0"""
+        # Get current date and calculate time ranges
         current_date = datetime.now()
-
-        # Calculate last week's date range
-        last_week_start = (current_date + relativedelta(weekday=MO(-2))).strftime('%Y-%m-%d')
-        last_week_end = (current_date + relativedelta(weekday=SU(-2))).strftime('%Y-%m-%d') if current_date.weekday() == 6 else (current_date + relativedelta(weekday=SU(-1))).strftime('%Y-%m-%d')
+        last_week_start = (current_date - timedelta(days=7)).strftime('%Y-%m-%d')
+        last_week_end = current_date.strftime('%Y-%m-%d')
+        past_month_start = (current_date - timedelta(days=30)).strftime('%Y-%m-%d')
+        past_month_end = current_date.strftime('%Y-%m-%d')
         
-        # Calculate past month's date range
-        past_month_start = (current_date + relativedelta(day=1, month=current_date.month-1)).strftime('%Y-%m-%d')
-        past_month_end = ((current_date  + relativedelta(day=1, month=current_date.month )) - timedelta(days=1)).strftime('%Y-%m-%d')
+        # Get CFC-Spoke mapping
+        cfc_spoke_mapping = self.bigquery_client.get_cfc_spoke_mapping()
+        cfc_list = list(cfc_spoke_mapping.keys())
+        spoke_list = []
+        for spokes in cfc_spoke_mapping.values():
+            spoke_list.extend(spokes)
+        spoke_list = list(set(spoke_list))  # Remove duplicates
         
-        # First, get table schemas for context
+        # Get schema context
         schema_context = self._get_schema_context()
         
         prompt = f"""You are a Flash Thinking 2.0 constraint extractor for a SQL query generator.
@@ -101,6 +106,9 @@ Location hierarchy rules:
 3. All CFCs together form the network
 4. Use cfc_spoke_mapping table to resolve relationships
 
+Available CFCs: {', '.join(cfc_list)}
+Available Spokes: {', '.join(spoke_list)}
+
 Time-related rules:
 1. Time filters (for WHERE clause):
    - "last week" = {last_week_start} to {last_week_end}
@@ -112,6 +120,7 @@ Time-related rules:
    - "this year" = {(current_date - timedelta(days=365)).strftime('%Y-%m-%d')} to {current_date.strftime('%Y-%m-%d')}
    - "next month" = {(current_date + relativedelta(day=1, month=current_date.month+1)).strftime('%Y-%m-%d')} to {(current_date + relativedelta(day=1, month=current_date.month+1)).strftime('%Y-%m-%d')}
    - "next year" = {(current_date + relativedelta(day=1, month=current_date.month+1)).strftime('%Y-%m-%d')} to {(current_date + relativedelta(day=1, month=current_date.month+1)).strftime('%Y-%m-%d')}
+   - For specific years (e.g., "2025"), use the full year range: "2025-01-01" to "2025-12-31"
 2. Time aggregation (for GROUP BY):
    - If not explicitly specified, default to "Daily"
    - Valid values: "Hourly", "Daily", "Weekly", "Monthly", "Quarterly", "Yearly"
@@ -173,6 +182,7 @@ IMPORTANT:
    - cfc should be empty list for network-level questions
    - spokes should be "all" if all spokes are needed
    - Both should be empty lists if not mentioned
+   - Only use CFCs and spokes from the provided lists
 7. For tool_calls:
    - List all BigQuery queries that will be needed
    - Each query should have a descriptive name and purpose
@@ -228,7 +238,23 @@ IMPORTANT:
                         }
                     else:
                         constraints[field] = []
-                    
+            
+            # Validate CFCs and spokes against the mapping
+            if constraints["cfc"]:
+                valid_cfcs = [cfc for cfc in constraints["cfc"] if cfc in cfc_list]
+                if valid_cfcs != constraints["cfc"]:
+                    print(f"Warning: Some CFCs were not found in the mapping: {set(constraints['cfc']) - set(valid_cfcs)}")
+                constraints["cfc"] = valid_cfcs
+            
+            if constraints["spokes"]:
+                if constraints["spokes"] == "all":
+                    constraints["spokes"] = spoke_list
+                else:
+                    valid_spokes = [spoke for spoke in constraints["spokes"] if spoke in spoke_list]
+                    if valid_spokes != constraints["spokes"]:
+                        print(f"Warning: Some spokes were not found in the mapping: {set(constraints['spokes']) - set(valid_spokes)}")
+                    constraints["spokes"] = valid_spokes
+            
             return constraints
             
         except json.JSONDecodeError as e:

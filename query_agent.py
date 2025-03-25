@@ -110,6 +110,10 @@ class QueryAgent:
         Returns:
             A SQL query string
         """
+        print(f"\nGenerating orders query with:")
+        print(f"Tool call: {json.dumps(tool_call, indent=2)}")
+        print(f"Constraints: {json.dumps(constraints, indent=2)}")
+        
         # Extract parameters from constraints and tool call
         time_filter = constraints.get("time_filter", {})
         start_date = time_filter.get("start_date", "")
@@ -117,23 +121,68 @@ class QueryAgent:
         
         # Determine aggregation type
         aggregation_type = self._determine_aggregation_type(tool_call, constraints)
+        print(f"Using aggregation type: {aggregation_type}")
         
         # Extract location filters
         cfc = constraints.get("cfc", [])
         spokes = constraints.get("spokes", [])
+        print(f"Location filters - CFC: {cfc}, Spokes: {spokes}")
         
         # Determine group by fields
         group_by_fields = self._determine_group_by_fields(tool_call, constraints)
+        print(f"Group by fields: {group_by_fields}")
+        
+        # Handle different types of comparisons
+        comparison_type = constraints.get("comparison_type")
+        if comparison_type:
+            # Extract the specific location to compare from the tool call name
+            tool_call_name = tool_call.get("name", "").lower()
+            
+            # For location comparisons, filter based on the specific location in the tool call name
+            if comparison_type == "between_locations":
+                # Extract location from tool call name (e.g., "get_orders_london" -> "london")
+                location = tool_call_name.split("_")[-1] if "_" in tool_call_name else ""
+                
+                if location:
+                    # If comparing CFCs
+                    if constraints.get("location_type") == "CFC":
+                        cfc_filter = [location]
+                        spokes_filter = []
+                    # If comparing spokes
+                    elif constraints.get("location_type") == "Spoke":
+                        cfc_filter = cfc  # Keep all CFCs
+                        spokes_filter = [location]
+                    # If comparing CFC vs Spoke
+                    else:
+                        # Check if the location is a CFC or spoke
+                        if location in cfc:
+                            cfc_filter = [location]
+                            spokes_filter = []
+                        else:
+                            cfc_filter = cfc
+                            spokes_filter = [location]
+                else:
+                    cfc_filter = cfc
+                    spokes_filter = spokes
+            else:
+                cfc_filter = cfc
+                spokes_filter = spokes
+        else:
+            cfc_filter = cfc
+            spokes_filter = spokes
         
         # Use the OrdersQueryBuilder to build the query
-        return OrdersQueryBuilder.build_query(
+        query = OrdersQueryBuilder.build_query(
             aggregation_type=aggregation_type,
             start_date=start_date,
             end_date=end_date,
-            cfc=cfc,
-            spoke=spokes,
+            cfc=cfc_filter,
+            spoke=spokes_filter,
             group_by_fields=group_by_fields
         )
+        
+        print(f"\nGenerated SQL query:\n{query}")
+        return query
     
     def _determine_aggregation_type(self, tool_call: Dict[str, Any], constraints: Dict[str, Any]) -> str:
         """
