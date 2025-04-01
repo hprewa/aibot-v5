@@ -1,0 +1,64 @@
+{
+  "text-to-sql-dev.chatbotdb.orders_drt": [
+    "week_date",
+    "delivery_date",
+    "cfc",
+    "spoke",
+    "orders",
+    "eaches"
+  ],
+  "text-to-sql-dev.chatbotdb.slot_availability_drt": [
+    "week_start",
+    "delivery_date",
+    "cfc",
+    "spoke",
+    "available_slots",
+    "total_slots",
+    "slot_availability"
+  ],
+  "text-to-sql-dev.chatbotdb.cfc_spoke_mapping": [
+    "cfc",
+    "spoke",
+    "is_active",
+    "created_at",
+    "updated_at"
+  ],
+  "text-to-sql-dev.chatbotdb.sessions": [
+    "session_id",
+    "user_id",
+    "question",
+    "constraints",
+    "response_plan",
+    "strategy",
+    "summary",
+    "status",
+    "tool_calls",
+    "tool_call_status",
+    "tool_call_results",
+    "results",
+    "slack_channel",
+    "error",
+    "created_at",
+    "updated_at"
+  ],
+  "text-to-sql-dev.chatbotdb.question_classifications": [
+    "id",
+    "question",
+    "question_type",
+    "confidence",
+    "requires_sql",
+    "requires_summary",
+    "classification_metadata",
+    "session_id",
+    "created_at",
+    "updated_at"
+  ],
+  "text-to-sql-dev.chatbotdb.question_categories": [
+    "category_id",
+    "question_type",
+    "description",
+    "example",
+    "created_at",
+    "updated_at"
+  ]
+}

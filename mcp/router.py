@@ -13,11 +13,18 @@ import uuid
 from .protocol import Context, ContextMetadata
 from .models import ClassificationData, SessionData, ResponseData
 import traceback
+import concurrent.futures
+import threading
+import sqlite3
+import asyncio
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import required components
 from query_processor import QueryProcessor
 from query_agent import QueryAgent
-from response_agent import ResponseAgent
+from response_agent import ResponseAgent, DateTimeEncoder
 from bigquery_client import BigQueryClient
 from gemini_client import GeminiClient
 
@@ -27,6 +34,64 @@ logger = logging.getLogger(__name__)
 
 # Simple in-memory cache for testing purposes
 session_cache = {}
+
+# Global variable to maintain warm instances
+_warm_clients = None
+_warm_lock = threading.Lock()
+
+class LazyBigQueryClient:
+    _instance = None
+    
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = BigQueryClient()
+        return cls._instance
+
+class PersistentSchemaCache:
+    CACHE_FILE = "schema_cache.sqlite"
+    
+    @classmethod
+    def get_schema(cls, table_name):
+        with sqlite3.connect(cls.CACHE_FILE) as conn:
+            cursor = conn.cursor()
+            schema = cursor.execute(
+                "SELECT schema FROM schemas WHERE table_name = ?",
+                (table_name,)
+            ).fetchone()
+            if schema:
+                return json.loads(schema[0])
+        return None
+
+class Clients:
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance.bigquery = None
+                cls._instance.gemini = None
+            return cls._instance
+    
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+    
+    @classmethod
+    def initialize(cls):
+        instance = cls.get_instance()
+        with cls._lock:
+            if instance.bigquery is None:
+                print("Initializing shared BigQuery client...")
+                instance.bigquery = BigQueryClient()
+            if instance.gemini is None:
+                print("Initializing shared Gemini client...")
+                instance.gemini = GeminiClient()
+        return instance
 
 class MCPRouter:
     """
@@ -70,12 +135,44 @@ class MCPRouter:
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-        # Initialize required components
-        self.gemini_client = GeminiClient()
-        self.bigquery_client = BigQueryClient()
-        self.query_processor = QueryProcessor(self.gemini_client, self.bigquery_client)
-        self.query_agent = QueryAgent(self.gemini_client)
-        self.response_agent = ResponseAgent(self.gemini_client)
+        # Get shared client instances
+        clients = Clients.get_instance()
+        if not clients.bigquery or not clients.gemini:
+            clients.initialize()
+        
+        # Use shared clients
+        self.query_processor = QueryProcessor(clients.gemini, clients.bigquery)
+        self.query_agent = QueryAgent(clients.gemini)
+        self.response_agent = ResponseAgent(clients.gemini)
+        
+        # Log instance IDs during initialization
+        self.logger.info(f"Router Init: Router ID = {id(self)}")
+        self.logger.info(f"Router Init: QueryProcessor ID = {id(self.query_processor)}")
+        self.logger.info(f"Router Init: QueryAgent ID = {id(self.query_agent)}")
+        self.logger.info(f"Router Init: ResponseAgent ID = {id(self.response_agent)}")
+        if hasattr(self.query_processor, 'gemini_client'):
+             self.logger.info(f"Router Init: QP GeminiClient ID = {id(self.query_processor.gemini_client)}")
+        if hasattr(self.query_agent, 'gemini_client'):
+             self.logger.info(f"Router Init: QA GeminiClient ID = {id(self.query_agent.gemini_client)}")
+        if hasattr(self.response_agent, 'gemini_client'):
+             self.logger.info(f"Router Init: RA GeminiClient ID = {id(self.response_agent.gemini_client)}")
+        
+        # Define routing map
+        self.route_map = {
+            "kpi extraction": self._handle_full_pipeline,
+            "comparative analysis": self._handle_full_pipeline,
+            "trend analysis": self._handle_full_pipeline,
+            "anomaly detection": self._handle_full_pipeline,
+            "categorical breakdown": self._handle_full_pipeline,
+            "ranking": self._handle_full_pipeline,
+            "other analytics": self._handle_full_pipeline,
+            "forecasting": self._handle_planned_feature,
+            "unsupported/random questions": self._handle_unsupported_feature,
+            "data source": self._handle_clarification_needed,
+            "clarification needed": self._handle_clarification_needed,
+            "small talk": self._handle_small_talk,
+            "feedback": self._handle_feedback
+        }
         
     def get_cached_session(self, session_id):
         """Get a session from the in-memory cache"""
@@ -104,25 +201,8 @@ class MCPRouter:
         self.logger.info(f"Routing question type: {question_type} with confidence {classification.confidence}")
         
         # Route to appropriate handler based on classification
-        if question_type in ["kpi extraction", "comparative analysis", 
-                           "trend analysis", "anomaly detection", 
-                           "categorical breakdown", "ranking", "other analytics"]:
-            return self._handle_full_pipeline(classification_context, session_manager)
-        
-        elif question_type in ["forecasting"]:
-            return self._handle_planned_feature(classification_context, session_manager)
-            
-        elif question_type in ["unsupported/random questions"]:
-            return self._handle_unsupported_feature(classification_context, session_manager)
-            
-        elif question_type in ["data source", "clarification needed"]:
-            return self._handle_clarification_needed(classification_context, session_manager)
-            
-        elif question_type in ["small talk"]:
-            return self._handle_small_talk(classification_context, session_manager)
-            
-        elif question_type in ["feedback"]:
-            return self._handle_feedback(classification_context, session_manager)
+        if question_type in self.route_map:
+            return self.route_map[question_type](classification_context, session_manager)
             
         else:
             # Default to full pipeline for unknown types
@@ -154,6 +234,25 @@ class MCPRouter:
         user_id = classification_context.metadata.user_id or getattr(classification_context.data, 'user_id', 'anonymous')
         
         try:
+            # --- Re-verify QueryProcessor instance ---
+            if not hasattr(self, 'query_processor') or not self.query_processor:
+                self.logger.error("!!! QueryProcessor not initialized correctly in router instance! Re-initializing...")
+                clients = Clients.get_instance()
+                if not clients.bigquery or not clients.gemini:
+                    clients.initialize()
+                self.query_processor = QueryProcessor(clients.gemini, clients.bigquery)
+            elif not hasattr(self.query_processor, 'extract_constraints'):
+                 self.logger.error(f"!!! QueryProcessor exists but LACKS extract_constraints method! Type: {type(self.query_processor)}")
+                 # Attempt re-initialization as a potential fix
+                 clients = Clients.get_instance()
+                 if not clients.bigquery or not clients.gemini:
+                    clients.initialize()
+                 self.query_processor = QueryProcessor(clients.gemini, clients.bigquery)
+                 if not hasattr(self.query_processor, 'extract_constraints'):
+                     # If still missing after re-init, raise to stop
+                     raise AttributeError("QueryProcessor still lacks extract_constraints after re-initialization.")
+            # ------------------------------------------
+            
             # First, ensure the session exists with correct user_id and question
             if session_manager:
                 current_session = session_manager.get_session(session_id)
@@ -170,74 +269,194 @@ class MCPRouter:
             # Step 2: Generate SQL queries
             self.logger.info("Generating SQL queries...")
             tool_calls = []
+            tool_call_status = {} # Initialize status dictionary here
+            
             for tool_call in constraints.get("tool_calls", []):
+                tool_name = tool_call.get("name", "unknown_tool")
+                sql = None 
+                
+                # --- Try generating SQL ---
                 try:
+                    self.logger.info(f"Attempting SQL generation for tool call: {tool_name}")
                     sql = self.query_agent.generate_query(tool_call, constraints)
-                    tool_calls.append({
-                        "name": tool_call["name"],
-                        "sql": sql,
-                        "result_id": tool_call["result_id"]
-                    })
-                    self.logger.info(f"Generated SQL for {tool_call['name']}: {sql[:100]}...")
-                except Exception as e:
-                    self.logger.error(f"Error generating SQL for tool call {tool_call['name']}: {str(e)}")
-                    continue
+                    if not sql:
+                        self.logger.error(f"SQL generation for {tool_name} returned empty result (None). Marking as failed.")
+                        tool_call_status[tool_name] = "failed"
+                        continue # Skip to next tool call
+                except Exception as gen_e:
+                    self.logger.error(f"!!! Exception during SQL generation for {tool_name}: {str(gen_e)}")
+                    self.logger.error(traceback.format_exc()) 
+                    tool_call_status[tool_name] = "failed" 
+                    continue # Skip to next tool call
+                    
+                # --- If SQL was generated, try appending ---
+                if sql:
+                    try:
+                        self.logger.info(f"SQL generated for {tool_name}. Appending to tool_calls list...")
+                        tool_calls.append({
+                            "name": tool_name,
+                            "sql": sql,
+                            "result_id": tool_call["result_id"]
+                        })
+                        # If append succeeds, status remains unset (implicitly pending/success unless execution fails later)
+                        self.logger.info(f"Append successful for {tool_name}.")
+                    except Exception as append_e:
+                        self.logger.error(f"!!! Exception during append for {tool_name}: {str(append_e)}")
+                        self.logger.error(traceback.format_exc()) 
+                        tool_call_status[tool_name] = "failed" # Mark as failed if append fails
+                        continue
+                    
+                    # --- Try logging the generated SQL (non-critical) ---
+                    try:
+                        # Simplify logging to reduce potential errors
+                        self.logger.info(f"Successfully generated and appended SQL for {tool_name}.") 
+                    except Exception as log_e:
+                        self.logger.error(f"!!! Exception while logging success for {tool_name}: {str(log_e)}")
+                        # Do not mark as failed or continue just for logging error
+            
+            # --- After loop ---
+            self.logger.info(f"Completed SQL generation loop. Tool calls list count: {len(tool_calls)}")
+            self.logger.info(f"Tool call status after Step 2 (only failures marked): {json.dumps(tool_call_status)}")
             
             # Step 3: Execute queries and collect results
             self.logger.info("Executing queries...")
             results = {}
-            tool_call_status = {}
-            for tool_call in tool_calls:
+            # tool_call_status is already initialized and updated in Step 2 loop
+            for tool_call in tool_calls: # Iterate over successfully generated SQL
+                tool_name = tool_call["name"]
+                # Skip execution if already marked as failed in Step 2
+                if tool_call_status.get(tool_name) == "failed":
+                    self.logger.warning(f"Skipping execution for {tool_name} as it failed during generation.")
+                    continue
+                
                 try:
-                    self.logger.info(f"Executing query {tool_call['name']} with SQL: {tool_call['sql']}")
-                    result = self.bigquery_client.execute_query(tool_call["sql"])
-                    self.logger.info(f"Query {tool_call['name']} returned {len(result)} rows")
+                    self.logger.info(f"Executing query {tool_name} with SQL: {tool_call['sql']}")
                     
-                    # Format datetime objects in results
+                    # Prepare parameters for the query
+                    query_params = {}
+                    time_filter = constraints.get("time_filter", {})
+                    if time_filter.get("start_date"):
+                        query_params["start_date"] = time_filter["start_date"]
+                    if time_filter.get("end_date"):
+                        query_params["end_date"] = time_filter["end_date"]
+                    if constraints.get("cfc"):
+                        query_params["cfcs"] = constraints["cfc"] # Use 'cfcs' as expected by BQ client parameter logic for lists
+                    if constraints.get("spokes") and constraints["spokes"] != "all":
+                        query_params["spokes"] = constraints["spokes"] # Use 'spokes' as expected by BQ client
+                    
+                    self.logger.info(f"Executing query {tool_name} via BigQueryClient with params: {query_params}")
+                    # Call the correct execute_query method on the BigQueryClient instance
+                    result = self.query_processor.bigquery_client.execute_query(
+                        tool_call["sql"],
+                        params=query_params
+                    )
+                    self.logger.info(f"Query {tool_name} returned {len(result)} rows")
+                    
+                    # Format datetime objects and convert NumPy types in results
                     formatted_result = []
                     for row in result:
                         formatted_row = {}
                         for key, value in row.items():
                             if isinstance(value, datetime):
                                 formatted_row[key] = value.isoformat()
-                            else:
+                            # Explicitly convert potential NumPy types
+                            elif hasattr(value, 'item'): # Check if it has numpy's item() method
+                                try:
+                                    formatted_row[key] = value.item() # Convert numpy types (int64, float64, etc.) to standard python types
+                                except Exception:
+                                    # Fallback if item() fails for some reason
+                                    formatted_row[key] = str(value) if value is not None else None
+                            elif isinstance(value, (int, float, str, bool)) or value is None:
+                                # Keep standard types as is
                                 formatted_row[key] = value
+                            else:
+                                # Convert other non-standard types to string as a fallback
+                                formatted_row[key] = str(value)
                         formatted_result.append(formatted_row)
                     
+                    # Determine the correct location for *this* tool_call's summary
+                    current_tool_location = None
+                    tool_call_name = tool_call.get("name", "").lower()
+                    # Simple heuristic: Check if known locations from constraints are in the tool call name
+                    known_cfcs = constraints.get("cfc", [])
+                    known_spokes = constraints.get("spokes", [])
+                    possible_locations = known_cfcs + (known_spokes if isinstance(known_spokes, list) else [])
+                    for loc in possible_locations:
+                        if loc in tool_call_name:
+                            current_tool_location = loc
+                            break # Use first match
+                    # Fallback if not found in name (should ideally not happen with good tool call names)
+                    if not current_tool_location:
+                         # Check the actual data if possible (more robust)
+                         if formatted_result and 'cfc' in formatted_result[0]:
+                              current_tool_location = formatted_result[0]['cfc']
+                         elif formatted_result and 'spoke' in formatted_result[0]:
+                              current_tool_location = formatted_result[0]['spoke']
+                         else:
+                              current_tool_location = "Unknown Location"
+
                     # Store results and update status
-                    results[tool_call["result_id"]] = formatted_result
-                    tool_call_status[tool_call["name"]] = "completed"
+                    results[tool_call["result_id"]] = {
+                        "status": "success",
+                        "data": {
+                            "data": formatted_result,
+                            "summary": {
+                                "total_records": len(formatted_result),
+                                "time_period": f"{constraints.get('time_filter', {}).get('start_date')} to {constraints.get('time_filter', {}).get('end_date')}",
+                                "location": current_tool_location, # Use the determined location for this tool
+                                "total_orders": {
+                                    "total": sum(int(row['total_orders']) for row in formatted_result if row.get('total_orders') is not None),
+                                    "average": sum(int(row['total_orders']) for row in formatted_result if row.get('total_orders') is not None) / len(formatted_result) if formatted_result else 0,
+                                    "max": max(int(row['total_orders']) for row in formatted_result if row.get('total_orders') is not None) if any(row.get('total_orders') is not None for row in formatted_result) else 0,
+                                    "min": min(int(row['total_orders']) for row in formatted_result if row.get('total_orders') is not None) if any(row.get('total_orders') is not None for row in formatted_result) else 0
+                                }
+                            }
+                        }
+                    }
+                    tool_call_status[tool_name] = "completed"
                     
                     # Log the first row of results for debugging
                     if formatted_result:
-                        self.logger.info(f"First row of results for {tool_call['name']}: {json.dumps(formatted_result[0], indent=2)}")
+                        self.logger.info(f"First row of results for {tool_name}: {json.dumps(formatted_result[0], indent=2)}")
                     else:
-                        self.logger.warning(f"No results returned for {tool_call['name']}")
+                        self.logger.warning(f"No results returned for {tool_name}")
                         
                 except Exception as e:
-                    self.logger.error(f"Error executing query {tool_call['name']}: {str(e)}")
-                    tool_call_status[tool_call["name"]] = "failed"
+                    self.logger.error(f"Error executing query {tool_name}: {str(e)}")
+                    tool_call_status[tool_name] = "failed"
                     continue
             
             # Step 4: Generate response using the response agent
             self.logger.info("Generating response...")
-            self.logger.info(f"Results being passed to response agent: {json.dumps(results, indent=2)}")
+            self.logger.info(f"Results being passed to response agent: {json.dumps(results, indent=2, cls=DateTimeEncoder)}")
+            self.logger.info(f"Constraints being passed to response agent: {json.dumps(constraints, indent=2)}")
             
             # Check if we have any results
             if not results:
                 self.logger.error("No results were returned from any queries")
                 response_text = "I apologize, but I couldn't retrieve any data for your query. Please try again or rephrase your question."
             else:
-                response_text = self.response_agent.generate_response(
-                    classification.question,
-                    results,
-                    constraints
-                )
+                try:
+                    # Generate response using response agent - pass all results and constraints
+                    self.logger.info("Attempting to generate response via ResponseAgent...")
+                    response_text = self.response_agent.generate_response(
+                        classification.question,
+                        results, # Pass the entire results dictionary
+                        constraints # Pass the constraints which include the response_plan
+                    )
+                    self.logger.info(f"Response received from ResponseAgent: '{response_text[:100]}...'")
+
+                    # If response is empty or error, generate a default response (less likely needed now)
+                    if not response_text or response_text.strip() == "":
+                        self.logger.error("Empty response from response agent, generating fallback.")
+                        response_text = "I was able to retrieve the data, but encountered an issue generating the summary. Please check the raw results if available."
+                    else:
+                        self.logger.info("ResponseAgent returned a valid response.")
+
+                except Exception as e:
+                    self.logger.error(f"!!! Exception during response generation: {str(e)}")
             
-            if not response_text:
-                self.logger.error("No response text generated")
-                response_text = "I apologize, but I couldn't generate a response from the data."
-            
+            self.logger.info(f"Final response_text before creating ResponseData: '{response_text}'")
             # Create response data
             response_data = ResponseData(
                 query=classification.question,
@@ -524,3 +743,102 @@ class MCPRouter:
         )
         
         return response_context 
+
+    def _init_schema_cache(self):
+        """Initialize schema cache with parallel loading"""
+        with ThreadPoolExecutor(max_workers=6) as executor:  # Increased workers
+            futures = [executor.submit(load_table_schema, (name, ref)) 
+                      for name, ref in self.tables.items()]
+            
+            # Use as_completed for faster processing
+            for future in as_completed(futures):
+                name, ref, schema = future.result()
+                if schema:
+                    self._schema_cache[ref] = schema
+
+def ensure_warm_clients():
+    global _warm_clients
+    with _warm_lock:
+        if _warm_clients is None:
+            _warm_clients = initialize_components()
+        return _warm_clients
+
+def cloud_function_handler(request):
+    # Use warm clients
+    clients = ensure_warm_clients()
+    # Handle request
+
+async def initialize_components_async():
+    async with asyncio.TaskGroup() as group:
+        bq_task = group.create_task(init_bigquery())
+        gemini_task = group.create_task(init_gemini())
+    return bq_task.result(), gemini_task.result()
+
+class ConnectionPool:
+    _pools = {}
+    
+    @classmethod
+    def get_connection(cls, service_type):
+        if service_type not in cls._pools:
+            cls._pools[service_type] = create_connection_pool(service_type)
+        return cls._pools[service_type].get_connection() 
+
+class ResourceManager:
+    def __init__(self):
+        self.resources = {}
+        self._locks = {}
+        self._init_tasks = {}
+    
+    async def get_resource(self, resource_type):
+        if resource_type not in self.resources:
+            if resource_type not in self._init_tasks:
+                async with self._get_lock(resource_type):
+                    if resource_type not in self._init_tasks:
+                        self._init_tasks[resource_type] = asyncio.create_task(
+                            self._initialize_resource(resource_type)
+                        )
+            await self._init_tasks[resource_type]
+        return self.resources[resource_type]
+
+class BigQueryConnectionPool:
+    _pool = None
+    _lock = threading.Lock()
+    
+    @classmethod
+    def get_connection(cls):
+        with cls._lock:
+            if cls._pool is None:
+                cls._pool = bigquery.Client()
+            return cls._pool 
+
+class SchemaCache:
+    CACHE_FILE = "schema_cache.json"
+    
+    @classmethod
+    def load(cls):
+        if os.path.exists(cls.CACHE_FILE):
+            with open(cls.CACHE_FILE, 'r') as f:
+                return json.load(f)
+        return {}
+    
+    @classmethod
+    def save(cls, schemas):
+        with open(cls.CACHE_FILE, 'w') as f:
+            json.dump(schemas, f) 
+
+class QuestionCategoriesCache:
+    _cache = None
+    _last_refresh = 0
+    _refresh_interval = 300  # 5 minutes
+    _lock = threading.Lock()
+    
+    @classmethod
+    def get_categories(cls, client):
+        current_time = time.time()
+        with cls._lock:
+            if cls._cache and current_time - cls._last_refresh < cls._refresh_interval:
+                return cls._cache.copy()  # Return copy to prevent mutations
+            
+            cls._cache = client.get_question_categories()
+            cls._last_refresh = current_time
+            return cls._cache.copy() 

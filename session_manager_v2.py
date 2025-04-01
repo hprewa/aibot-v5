@@ -3,9 +3,10 @@ Manages session creation, updates, tool call status, and retrieval of session da
 from typing import Dict, List, Optional, Any
 import json
 import uuid
-from datetime import datetime
+import datetime
 from bigquery_client import BigQueryClient
 import traceback
+import inspect
 
 # Custom JSON encoder to handle date objects
 class DateTimeEncoder(json.JSONEncoder):
@@ -36,7 +37,7 @@ class SessionManagerV2:
             thread_id = str(int(datetime.utcnow().timestamp() * 1000))[-6:]  # Last 6 digits of millisecond timestamp
             session_id = f"{timestamp}.{thread_id}"
         
-        current_time = datetime.utcnow().isoformat()
+        current_time = datetime.datetime.utcnow().isoformat()
         session_data = {
             "session_id": session_id,
             "user_id": user_id,
@@ -79,22 +80,71 @@ class SessionManagerV2:
                 
             # Convert the first row to a dictionary
             session = result.iloc[0].to_dict()
-            
+
+            # --- LOG RAW VALUES BEFORE PARSING ---
+            print("--- Raw session data fetched from BigQuery (before parsing): ---")
+            for key, value in session.items():
+                # Print type and a preview, especially for complex fields
+                preview = str(value)[:200] + ("..." if len(str(value)) > 200 else "")
+                print(f"  Raw Key: {key:<20} | Type: {type(value).__name__:<15} | Value Preview: {preview}")
+            print("------------------------------------------------------------")
+            # --- END LOG RAW VALUES ---
+
             # Parse JSON fields
             for field in ["constraints", "response_plan", "strategy", "tool_call_results", "results"]:
                 if session.get(field) and isinstance(session[field], str):
                     try:
                         session[field] = json.loads(session[field])
                     except json.JSONDecodeError:
-                        pass
-            
-            # Parse tool_calls and tool_call_status
-            if session.get("tool_calls") and isinstance(session["tool_calls"], str):
-                try:
-                    session["tool_calls"] = json.loads(session["tool_calls"])
-                except json.JSONDecodeError:
-                    session["tool_calls"] = []
-            
+                        pass # Keep as string if invalid JSON
+
+            # Parse tool_calls (handle potential array from BQ REPEATED field)
+            tool_calls_value = session.get("tool_calls")
+            if tool_calls_value is not None:
+                parsed_tool_calls = []
+                if isinstance(tool_calls_value, str):
+                    try:
+                        # If it's a JSON string representing a list, parse it
+                        parsed_list = json.loads(tool_calls_value)
+                        if isinstance(parsed_list, list):
+                            parsed_tool_calls = parsed_list # Assume items are already strings or simple types
+                        else:
+                            # If it's a string but not a JSON list, wrap it
+                            parsed_tool_calls = [tool_calls_value]
+                    except json.JSONDecodeError:
+                        # If it's a string that's not valid JSON, wrap it
+                        parsed_tool_calls = [tool_calls_value]
+                elif hasattr(tool_calls_value, 'tolist'): # Check for array-like (e.g., numpy array from pandas)
+                    try:
+                        # Convert array to a standard Python list
+                        # We expect items to be strings (serialized JSONs) from BQ
+                        parsed_tool_calls = tool_calls_value.tolist()
+                    except Exception as e:
+                        print(f"Warning: Could not convert tool_calls array to list: {e}")
+                        parsed_tool_calls = [] # Fallback to empty list
+                elif isinstance(tool_calls_value, list):
+                    # If it's already a list, use it directly
+                    parsed_tool_calls = tool_calls_value
+                else:
+                     # Fallback for other unexpected types
+                     print(f"Warning: Unexpected type for tool_calls: {type(tool_calls_value)}. Converting to list of string.")
+                     parsed_tool_calls = [str(tool_calls_value)]
+
+                # Now, attempt to parse each item in the list if it looks like JSON
+                final_tool_calls = []
+                for item in parsed_tool_calls:
+                    if isinstance(item, str) and item.startswith('{') and item.endswith('}'):
+                        try:
+                            final_tool_calls.append(json.loads(item))
+                        except json.JSONDecodeError:
+                            final_tool_calls.append(item) # Keep as string if not valid JSON
+                    else:
+                        final_tool_calls.append(item) # Keep non-dict strings as is
+                session["tool_calls"] = final_tool_calls
+            else:
+                session["tool_calls"] = [] # Default to empty list if None
+
+            # Parse tool_call_status
             if session.get("tool_call_status") and isinstance(session["tool_call_status"], str):
                 try:
                     session["tool_call_status"] = json.loads(session["tool_call_status"])
@@ -115,21 +165,26 @@ class SessionManagerV2:
         Instead of updating the existing row, we insert a new row with the updated information.
         This avoids the streaming buffer limitation in BigQuery.
         """
+        # --- DETAILED LOGGING START ---
+        caller_frame = inspect.currentframe().f_back
+        caller_info = inspect.getframeinfo(caller_frame)
+        print(f"\n--- Calling update_session for session_id: {session_id} ---")
+        print(f"    Called from: {caller_info.filename} - Line {caller_info.lineno} - Function {caller_info.function}")
+        print(f"    Updates dictionary keys: {list(updates.keys())}")
+        # Optional: Log the summary if present
+        if 'summary' in updates:
+             print(f"    Summary in updates: {updates['summary'][:100]}...")
+        # --- DETAILED LOGGING END ---
         try:
             # Get the current session data
             current_session = self.get_session(session_id)
             if not current_session:
-                # If session doesn't exist, create it with the provided updates
-                print(f"Session {session_id} not found, creating new session with provided data")
-                try:
-                    # Extract user_id and question from updates
-                    user_id = updates.get("user_id", "anonymous")
-                    question = updates.get("question", "Unknown question")
-                    self.create_session(user_id, question, session_id)
-                    current_session = self.get_session(session_id)
-                except Exception as e:
-                    print(f"Failed to create new session: {str(e)}")
-                    raise ValueError(f"Session {session_id} not found and could not be created")
+                # If session doesn't exist, log an error and return. 
+                # update_session should not create sessions.
+                print(f"Error: update_session called for non-existent session_id: {session_id}")
+                # Optionally raise an error, or just return to prevent insertion
+                # raise ValueError(f"Session {session_id} not found, cannot update.")
+                return # Stop processing if session doesn't exist
             
             # Create a new session data dictionary with the updated information
             updated_session = current_session.copy()
@@ -147,11 +202,12 @@ class SessionManagerV2:
             updated_session.update(filtered_updates)
             
             # Set the updated_at timestamp
-            updated_session["updated_at"] = datetime.utcnow().isoformat()
+            updated_session["updated_at"] = datetime.datetime.utcnow().isoformat()
             
-            # Convert complex objects to JSON strings for storage
+            # Convert complex objects to JSON strings or handle REPEATED fields
             for key, value in updated_session.items():
-                if key in ["constraints", "response_plan", "strategy", "tool_call_results", "results"]:
+                # Handle fields that should be stored as JSON strings
+                if key in ["constraints", "response_plan", "strategy", "tool_call_results", "results", "tool_call_status"]:
                     if value is not None and not isinstance(value, str):
                         try:
                             updated_session[key] = json.dumps(value, cls=DateTimeEncoder)
@@ -160,15 +216,44 @@ class SessionManagerV2:
                             traceback.print_exc()
                             # Store a simplified version that can be serialized
                             updated_session[key] = json.dumps({"error": f"Could not serialize {key}: {str(e)}"})
-            
-            # Convert tool_calls to JSON if it's a list
-            if "tool_calls" in updated_session and isinstance(updated_session["tool_calls"], list):
-                updated_session["tool_calls"] = json.dumps(updated_session["tool_calls"], cls=DateTimeEncoder)
-            
-            # Convert tool_call_status to JSON if it's a dictionary
-            if "tool_call_status" in updated_session and isinstance(updated_session["tool_call_status"], dict):
-                updated_session["tool_call_status"] = json.dumps(updated_session["tool_call_status"], cls=DateTimeEncoder)
-            
+                # Handle tool_calls specifically for REPEATED STRING field
+                elif key == "tool_calls":
+                    if value is not None:
+                        if isinstance(value, list):
+                            # Ensure all items in the list are strings
+                            try:
+                                # Serialize items if they are not strings (e.g., dicts)
+                                updated_session[key] = [json.dumps(item, cls=DateTimeEncoder) if not isinstance(item, str) else item for item in value]
+                            except Exception as e:
+                                print(f"Error processing tool_calls list items: {str(e)}")
+                                traceback.print_exc()
+                                # Store error representation if items can't be processed
+                                updated_session[key] = [json.dumps({"error": f"Could not process tool_call item: {str(e)}"})]
+                        elif isinstance(value, str):
+                            # If it's already a string, try parsing it as JSON list first
+                            try:
+                                parsed_list = json.loads(value)
+                                if isinstance(parsed_list, list):
+                                     # If parsing succeeds and it's a list, process its items
+                                     updated_session[key] = [json.dumps(item, cls=DateTimeEncoder) if not isinstance(item, str) else item for item in parsed_list]
+                                else:
+                                     # If it's a string but not a JSON list, wrap it in a list
+                                     updated_session[key] = [value]
+                            except json.JSONDecodeError:
+                                 # If it's a string that's not valid JSON, wrap it in a list
+                                 updated_session[key] = [value]
+                        else:
+                             # For other types, try to convert to string and wrap in list
+                             try:
+                                 # Serialize the whole value as a single string item in the list
+                                 updated_session[key] = [json.dumps(value, cls=DateTimeEncoder)]
+                             except Exception as e:
+                                 print(f"Error converting non-list/non-string tool_calls value to string: {str(e)}")
+                                 updated_session[key] = [json.dumps({"error": f"Could not process tool_calls value: {str(e)}"})]
+                    else:
+                        # Ensure it's an empty list if None
+                        updated_session[key] = [] # Use empty list for None
+
             # Remove any fields that don't exist in the schema
             for key in list(updated_session.keys()):
                 if key not in schema_fields:

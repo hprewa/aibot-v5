@@ -9,53 +9,116 @@ from google.cloud import bigquery
 import vertexai
 from vertexai.preview.generative_models import GenerativeModel
 from typing import Optional, Dict, Any
+import threading
+from connection_pool import ConnectionPool
 
 class GeminiClient:
-    """Client for interacting with Google's AI models via Vertex AI"""
+    _instance = None
+    _lock = threading.Lock()
+    _model = None
+    
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance.initialized = False
+            return cls._instance
     
     def __init__(self):
-        self._initialize_client()
-        self.last_request_time = 0
-        self.min_request_interval = 1.5  # Minimum seconds between requests
-        self.max_retries = 3
-        self.retry_delay = 2.0
+        if self.initialized:
+            return
+            
+        print("\nInitializing Vertex AI with project: text-to-sql-dev")
+        print("\nUsing model: gemini-2.0-pro-exp-02-05")
         
-    def _initialize_client(self):
-        """Initialize the client using Vertex AI"""
+        # Initialize model only if needed
+        if not self._model:
+            with self._lock:
+                if not self._model:
+                    self._model = self._initialize_model()
+        
+        # Initialize retry settings
+        self.max_retries = 3
+        self.retry_delay = 1  # Initial delay in seconds
+        self.max_delay = 8    # Maximum delay in seconds
+        self.last_request_time = 0
+        self.min_request_interval = 0.1  # Minimum time between requests in seconds
+        
+        self.initialized = True
+        print("\nConnection test successful!")
+    
+    @classmethod
+    def _initialize_model(cls):
+        """Initialize the Gemini model with connection pooling"""
         try:
-            # Get project configuration
-            self.project_id = os.getenv('PROJECT_ID')
-            if not self.project_id:
-                raise ValueError("PROJECT_ID environment variable is not set")
-            
             # Initialize Vertex AI
-            vertexai.init(
-                project=self.project_id,
-                location=os.getenv('GEMINI_LOCATION', 'us-central1')
-            )
+            vertexai.init(project="text-to-sql-dev", location="us-central1")
             
-            print("\nInitializing Vertex AI with project:", self.project_id)
+            # Create the model
+            model = GenerativeModel("gemini-2.0-pro-exp-02-05")
             
-            # Initialize Gemini model
-            self.model = GenerativeModel("gemini-2.0-pro-exp-02-05")
-            print("\nUsing model: gemini-2.0-pro-exp-02-05")
+            # Test the model with a simple prompt
+            test_response = model.generate_content("Hello")
+            print(f"Model test response: {test_response.text}")
             
-            # Test the configuration
-            self._test_connection()
-            
+            return model
         except Exception as e:
-            raise Exception(f"Failed to initialize Vertex AI client: {str(e)}")
-            
-    def _test_connection(self):
-        """Test the connection with a simple prompt"""
+            print(f"Error initializing Gemini model: {str(e)}")
+            raise
+    
+    def generate_content(self, prompt: str) -> str:
+        """Generate content using the Gemini model with retries"""
+        retry_count = 0
+        current_delay = self.retry_delay
+        
+        while retry_count <= self.max_retries:
+            try:
+                self._respect_rate_limit()
+                print(f"\nGenerating content with prompt length: {len(prompt)}")
+                print(f"Prompt preview: {prompt[:500]}...")
+                response = self._model.generate_content(prompt)
+                print(f"Response type: {type(response)}")
+                print(f"Response attributes: {dir(response)}")
+                print(f"Full response text: {response.text}")
+                return response.text
+            except Exception as e:
+                retry_count += 1
+                if retry_count <= self.max_retries:
+                    print(f"Attempt {retry_count} failed: {str(e)}. Retrying in {current_delay} seconds...")
+                    time.sleep(current_delay)
+                    current_delay = min(current_delay * 2, self.max_delay)  # Exponential backoff
+                else:
+                    print(f"All retry attempts failed: {str(e)}")
+                    raise
+    
+    def generate_structured_output(self, prompt: str, **kwargs) -> Dict[str, Any]:
+        """Generate structured output using the Gemini model with retries"""
+        retry_count = 0
+        current_delay = self.retry_delay
+        
+        while retry_count <= self.max_retries:
+            try:
+                self._respect_rate_limit()
+                response = self._model.generate_content(prompt)
+                return self._parse_response(response.text)
+            except Exception as e:
+                retry_count += 1
+                if retry_count <= self.max_retries:
+                    print(f"Attempt {retry_count} failed: {str(e)}. Retrying in {current_delay} seconds...")
+                    time.sleep(current_delay)
+                    current_delay = min(current_delay * 2, self.max_delay)  # Exponential backoff
+                else:
+                    print(f"All retry attempts failed: {str(e)}")
+                    raise
+    
+    def _parse_response(self, text: str) -> Dict[str, Any]:
+        """Parse the model response into structured output"""
         try:
-            response = self.model.generate_content("Test connection")
-            
-            if not response or not response.text:
-                raise Exception("Empty response from model")
-            print("\nConnection test successful!")
+            # Add your parsing logic here
+            return json.loads(text)
         except Exception as e:
-            raise Exception(f"Failed to test model connection: {str(e)}")
+            print(f"Error parsing response: {str(e)}")
+            return {"error": str(e), "raw_text": text}
             
     def _respect_rate_limit(self):
         """Enforce rate limiting between requests"""
@@ -70,42 +133,6 @@ class GeminiClient:
             
         # Update last request time after waiting
         self.last_request_time = time.time()
-            
-    def generate_content(self, prompt: str) -> Optional[str]:
-        """Generate content using the model with retry logic"""
-        # Initialize retry count
-        retry_count = 0
-        
-        while retry_count <= self.max_retries:
-            try:
-                # Respect rate limits
-                self._respect_rate_limit()
-                
-                # Make the request
-                response = self.model.generate_content(prompt)
-                return response.text if response else None
-                
-            except Exception as e:
-                retry_count += 1
-                error_message = str(e)
-                
-                # Check if it's a quota error
-                if "Quota exceeded" in error_message and retry_count <= self.max_retries:
-                    wait_time = self.retry_delay * retry_count
-                    print(f"Quota exceeded. Retrying in {wait_time} seconds... (Attempt {retry_count}/{self.max_retries})")
-                    time.sleep(wait_time)
-                else:
-                    print(f"Error generating content: {error_message}")
-                    if retry_count <= self.max_retries:
-                        wait_time = self.retry_delay * retry_count
-                        print(f"Retrying in {wait_time} seconds... (Attempt {retry_count}/{self.max_retries})")
-                        time.sleep(wait_time)
-                    else:
-                        # Max retries exceeded
-                        return None
-        
-        # If we've exhausted all retries
-        return None
             
     def generate_json_response(self, prompt: str) -> Dict[str, Any]:
         """Generate a structured JSON response using the model

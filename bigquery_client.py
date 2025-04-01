@@ -8,52 +8,120 @@ import vertexai
 from vertexai.preview.generative_models import GenerativeModel
 from typing import Optional, Dict, List, Any
 from google.api_core import retry
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import pandas as pd
 import uuid
 import traceback
+import threading
+from schema_cache import SchemaCache
+from connection_pool import ConnectionPool
+import time
 
 class BigQueryClient:
     """Client for interacting with BigQuery tables"""
     
+    _instance = None
+    _lock = threading.Lock()
+    _schema_cache = None
+    _initialized_schemas = set()
+    
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance.initialized = False
+            return cls._instance
+    
     def __init__(self):
-        self.project_id = os.getenv('PROJECT_ID')
-        self.dataset_id = os.getenv('DATASET_ID')
-        self.client = bigquery.Client()
-        
+        if self.initialized:
+            return
+            
         print("\nInitializing BigQueryClient...")
+        self.project_id = "text-to-sql-dev"
+        self.dataset_id = "chatbotdb"
         print(f"Project ID: {self.project_id}")
         print(f"Dataset ID: {self.dataset_id}")
-        print("Initializing BigQuery client...")
         
-        # Define table references
+        # Define table references first
         self.tables = {
             "orders": f"{self.project_id}.{self.dataset_id}.orders_drt",
             "slot_availability": f"{self.project_id}.{self.dataset_id}.slot_availability_drt",
             "cfc_spoke_mapping": f"{self.project_id}.{self.dataset_id}.cfc_spoke_mapping",
-            "sessions": f"{self.project_id}.{self.dataset_id}.sessions",  # Explicitly add sessions table
-            "question_classifications": f"{self.project_id}.{self.dataset_id}.question_classifications",  # Add question classifications table
-            "question_categories": f"{self.project_id}.{self.dataset_id}.question_categories"  # Add question categories table
+            "sessions": f"{self.project_id}.{self.dataset_id}.sessions",
+            "question_classifications": f"{self.project_id}.{self.dataset_id}.question_classifications",
+            "question_categories": f"{self.project_id}.{self.dataset_id}.question_categories"
         }
         
         print("Table references:")
-        for table_name, table_ref in self.tables.items():
-            print(f"- {table_name}: {table_ref}")
+        for name, ref in self.tables.items():
+            print(f"- {name}: {ref}")
         
-        print("\nInitializing schema cache...")
-        # Initialize schema cache
-        self.schema_cache = {}
-        self._load_table_schemas()
+        # Initialize BigQuery client
+        self.client = bigquery.Client(project=self.project_id)
         
-        # Ensure sessions table exists
+        # Load schema cache
+        self._init_schema_cache()
+        
+        self.initialized = True
+        
+        # Ensure critical tables exist
         self._ensure_sessions_table_exists()
-        
-        # Ensure question classifications table exists
         self._ensure_question_classifications_table_exists()
-        
-        # Ensure question categories table exists
         self._ensure_question_categories_table_exists()
         
+    def _init_schema_cache(self):
+        """Initialize schema cache"""
+        if self._schema_cache is None:
+            self._schema_cache = {}
+            
+        # Load schemas for all tables
+        for table_name, table_ref in self.tables.items():
+            schema = self._load_schema(table_name, table_ref)
+            if schema:
+                self._schema_cache[table_ref] = schema
+        
+        # Save the loaded schemas to cache
+        if self._schema_cache:
+            SchemaCache.save(self._schema_cache)
+    
+    def _load_schema(self, table_name: str, table_ref: str) -> Optional[List[str]]:
+        """Load schema for a single table"""
+        try:
+            table = self.client.get_table(table_ref)
+            schema = [field.name for field in table.schema]
+            print(f"Loaded schema for {table_name} with {len(schema)} columns")
+            return schema
+        except Exception as e:
+            print(f"Error loading schema for {table_name}: {str(e)}")
+            return None
+    
+    def get_schema(self, table_name: str) -> List[str]:
+        """Get schema for a table"""
+        table_ref = self.tables.get(table_name)
+        if not table_ref:
+            raise ValueError(f"Unknown table: {table_name}")
+            
+        # Try to get from cache first
+        schema = self._schema_cache.get(table_ref)
+        if schema:
+            return schema
+            
+        # Load if not in cache
+        schema = self._load_schema(table_name, table_ref)
+        if not schema:
+            raise ValueError(f"Failed to load schema for table: {table_name}")
+            
+        # Update cache
+        self._schema_cache[table_ref] = schema
+        SchemaCache.save(self._schema_cache)
+        
+        return schema
+    
+    def _validate_columns(self, table_name: str, columns: List[str]) -> bool:
+        """Validate column names against schema, loading schema if needed"""
+        schema = self.get_schema(table_name)
+        return all(column in schema for column in columns)
+    
     def _ensure_sessions_table_exists(self):
         """Ensure the sessions table exists, create it if it doesn't"""
         try:
@@ -102,7 +170,7 @@ class BigQueryClient:
                     print(f"Created sessions table {sessions_table_id}")
                     
                     # Add to schema cache
-                    self.schema_cache["sessions"] = schema
+                    self._schema_cache["sessions"] = schema
                 except Exception as create_error:
                     print(f"Error creating sessions table: {str(create_error)}")
                     raise
@@ -220,7 +288,7 @@ class BigQueryClient:
                     print(f"Backup table {backup_table_id} is empty, no data to copy")
                 
                 # Update the schema cache
-                self.schema_cache["sessions"] = schema
+                self._schema_cache["sessions"] = schema
                 
                 print(f"Successfully updated sessions table schema")
         except Exception as e:
@@ -235,7 +303,7 @@ class BigQueryClient:
                 print(f"\nLoading schema for {table_name} ({table_ref})")
                 try:
                     table = self.client.get_table(table_ref)
-                    self.schema_cache[table_name] = table.schema
+                    self._schema_cache[table_ref] = table.schema
                     print(f"Successfully loaded schema with {len(table.schema)} columns")
                     print(f"Columns: {[field.name for field in table.schema]}")
                 except Exception as e:
@@ -245,24 +313,15 @@ class BigQueryClient:
             
     def _get_table_schema(self, table_name: str, force_refresh: bool = False) -> Optional[List[bigquery.SchemaField]]:
         """Get schema for a specific table with optional refresh"""
-        if force_refresh or table_name not in self.schema_cache:
+        if force_refresh or table_name not in self._schema_cache:
             try:
                 table = self.client.get_table(self.tables[table_name])
-                self.schema_cache[table_name] = table.schema
+                self._schema_cache[table_name] = table.schema
             except Exception as e:
                 print(f"Error fetching schema for table {table_name}: {str(e)}")
                 return None
                 
-        return self.schema_cache.get(table_name)
-        
-    def _validate_columns(self, table_name: str, columns: List[str]) -> bool:
-        """Validate if columns exist in table schema"""
-        schema = self._get_table_schema(table_name)
-        if not schema:
-            return False
-            
-        schema_columns = {field.name for field in schema}
-        return all(col in schema_columns for col in columns)
+        return self._schema_cache.get(table_name)
         
     def get_column_type(self, table_name: str, column_name: str) -> Optional[str]:
         """Get the data type of a specific column"""
@@ -311,6 +370,192 @@ class BigQueryClient:
                 print(f"Successfully inserted row into {table_id}")
         except Exception as e:
             print(f"Error in insert_row: {str(e)}")
+            raise
+
+    def execute_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        Execute a SQL query in BigQuery
+        
+        Args:
+            query: SQL query to execute
+            params: Query parameters
+            
+        Returns:
+            List of dictionaries containing the query results
+        """
+        try:
+            print(f"\n================================")
+            print(f"EXECUTING QUERY WITH BIGQUERY CLIENT:")
+            print(f"Query: {query}")
+            print(f"Parameters: {json.dumps(params, indent=2, default=str) if params else 'None'}")
+            print(f"================================")
+            
+            # Verify client is initialized
+            if not hasattr(self, 'client') or self.client is None:
+                print("BigQuery client not initialized, creating a new client...")
+                self.client = bigquery.Client(project=self.project_id)
+            
+            # Create job config with parameters
+            job_config = bigquery.QueryJobConfig()
+            
+            if params:
+                query_params = []
+                
+                # Process parameters
+                for name, value in params.items():
+                    print(f"Processing parameter {name}: {value} (type: {type(value)})")
+                    
+                    # Handle array parameters (for IN clauses)
+                    if isinstance(value, list):
+                        # Ensure all list values are strings
+                        string_values = [str(v) for v in value]
+                        param = bigquery.ArrayQueryParameter(name, "STRING", string_values)
+                        print(f"Created array parameter {name} with values: {string_values}")
+                    else:
+                        # Handle scalar parameters based on their type
+                        if isinstance(value, (datetime, date)):
+                            param = bigquery.ScalarQueryParameter(name, "DATE", value)
+                            print(f"Created DATE parameter {name}: {value}")
+                        elif isinstance(value, int):
+                            param = bigquery.ScalarQueryParameter(name, "INT64", value)
+                            print(f"Created INT64 parameter {name}: {value}")
+                        elif isinstance(value, float):
+                            param = bigquery.ScalarQueryParameter(name, "FLOAT64", value)
+                            print(f"Created FLOAT64 parameter {name}: {value}")
+                        else:
+                            # Convert to string for all other types
+                            string_value = str(value)
+                            param = bigquery.ScalarQueryParameter(name, "STRING", string_value)
+                            print(f"Created STRING parameter {name}: {string_value}")
+                    
+                    query_params.append(param)
+                
+                # Set parameters on job_config
+                job_config.query_parameters = query_params
+                print(f"Set {len(query_params)} parameters on job_config")
+                
+                # Check if we're querying for dates where we don't have data available
+                try:
+                    if 'start_date' in params and 'end_date' in params:
+                        print(f"Checking data availability for date range: {params['start_date']} to {params['end_date']}")
+                        
+                        # First check if the dates make sense
+                        start_date = params['start_date']
+                        end_date = params['end_date']
+                        
+                        # Parse dates if they're strings
+                        if isinstance(start_date, str):
+                            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+                        if isinstance(end_date, str):
+                            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+                        
+                        # Check if we have data in reasonable ranges (e.g., 2022-2023)
+                        current_date = datetime.now().date()
+                        
+                        # Define known data range based on what's in the database
+                        data_start_date = datetime(2023, 3, 1).date()  # Known data start
+                        
+                        if end_date < data_start_date:
+                            print(f"Warning: Query end date {end_date} is earlier than our available data range (starts at {data_start_date})")
+                            print("This query will likely return no results.")
+                except Exception as date_check_error:
+                    print(f"Error checking date ranges: {str(date_check_error)}")
+            
+            # Execute query with retry logic
+            max_retries = 3
+            retry_count = 0
+            last_error = None
+            
+            while retry_count < max_retries:
+                try:
+                    print(f"Executing query (attempt {retry_count + 1}/{max_retries})...")
+                    query_job = self.client.query(query, job_config=job_config)
+                    
+                    # Wait for query to complete
+                    print("Waiting for query to complete...")
+                    results = list(query_job.result())
+                    
+                    # Convert to list of dictionaries
+                    print(f"Query completed successfully with {len(results)} rows")
+                    result_dicts = [dict(row.items()) for row in results]
+                    
+                    # If no results but query was successful, check why
+                    if not result_dicts:
+                        print("Query returned zero rows, checking possible reasons:")
+                        
+                        # Check date ranges
+                        if params and 'start_date' in params and 'end_date' in params:
+                            start_date = params['start_date']
+                            end_date = params['end_date']
+                            
+                            # Convert to date objects for comparison if needed
+                            if isinstance(start_date, str):
+                                try:
+                                    start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+                                except ValueError:
+                                    pass
+                            
+                            if isinstance(end_date, str):
+                                try:
+                                    end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+                                except ValueError:
+                                    pass
+                            
+                            # Check if dates are in the future
+                            current_date = datetime.now().date()
+                            if isinstance(start_date, date) and start_date > current_date:
+                                print(f"Zero results likely because start_date {start_date} is in the future")
+                            elif isinstance(end_date, date) and end_date > current_date:
+                                print(f"Zero results likely because end_date {end_date} is in the future")
+                            else:
+                                print(f"Zero results with valid date range: {start_date} to {end_date}")
+                                print("This likely means no data exists for this specific combination of parameters")
+                        
+                        # Check for location parameters
+                        if params and 'cfc' in params:
+                            location_params = params['cfc']
+                            if isinstance(location_params, list):
+                                print(f"Location parameters: {', '.join(location_params)}")
+                            else:
+                                print(f"Location parameter: {location_params}")
+                    
+                    # Debug output
+                    if result_dicts:
+                        print(f"First result row: {json.dumps(result_dicts[0], default=str)}")
+                    
+                    return result_dicts
+                    
+                except Exception as e:
+                    last_error = e
+                    print(f"Error executing query (attempt {retry_count + 1}): {str(e)}")
+                    
+                    # Check for specific error types that warrant a retry
+                    retry_error = False
+                    if "timeout" in str(e).lower() or "network" in str(e).lower() or "connection" in str(e).lower():
+                        retry_error = True
+                    
+                    if retry_error and retry_count < max_retries - 1:
+                        # Calculate exponential backoff time
+                        wait_time = 2 ** retry_count
+                        print(f"Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
+                        retry_count += 1
+                    else:
+                        print(f"Not retrying. Error: {str(e)}")
+                        break
+            
+            # If we reached here, all retries failed
+            if last_error:
+                print(f"All retry attempts failed. Last error: {str(last_error)}")
+                raise last_error
+            else:
+                raise Exception("Query execution failed for unknown reasons")
+                
+        except Exception as e:
+            print(f"Error in execute_query: {str(e)}")
+            print(f"Error type: {type(e)}")
+            print(f"Error traceback: {traceback.format_exc()}")
+            # Re-raise to allow calling functions to handle the error
             raise
 
     def get_cfc_spoke_mapping(self) -> Dict[str, List[str]]:
@@ -404,94 +649,6 @@ class BigQueryClient:
         query_job = self.client.query(query)
         query_job.result()  # Wait for the job to complete
 
-    def execute_query(self, query: str) -> List[Dict[str, Any]]:
-        """Execute a query and return the results as a list of dictionaries"""
-        try:
-            print(f"Executing query: {query}")
-            query_job = self.client.query(query)
-            
-            # Wait for the query to complete
-            query_job.result()
-            
-            # Check if there were any errors
-            if query_job.errors:
-                print(f"Query execution errors: {query_job.errors}")
-                return []
-            
-            # Get the results
-            results = list(query_job.result())
-            print(f"Query returned {len(results)} rows")
-            
-            # Convert to list of dictionaries
-            formatted_results = []
-            for row in results:
-                formatted_row = {}
-                for key, value in row.items():
-                    if isinstance(value, datetime):
-                        formatted_row[key] = value.isoformat()
-                    elif hasattr(value, 'isoformat'):  # Handle date objects
-                        formatted_row[key] = value.isoformat()
-                    else:
-                        formatted_row[key] = value
-                formatted_results.append(formatted_row)
-            
-            return formatted_results
-            
-        except Exception as e:
-            print(f"Error executing query: {str(e)}")
-            traceback.print_exc()
-            return []
-
-    def _ensure_question_classifications_table_exists(self):
-        """Ensure the question_classifications table exists, create it if it doesn't"""
-        try:
-            # Check if classifications table exists
-            classifications_table_id = self.tables["question_classifications"]
-            table_exists = False
-            
-            try:
-                table = self.client.get_table(classifications_table_id)
-                print(f"Question classifications table {classifications_table_id} exists")
-                table_exists = True
-                
-                # Update schema cache
-                self.schema_cache["question_classifications"] = table.schema
-            except Exception as e:
-                print(f"Question classifications table {classifications_table_id} does not exist, creating it...")
-                table_exists = False
-            
-            if not table_exists:
-                # Define schema for question_classifications table
-                schema = [
-                    bigquery.SchemaField("id", "STRING", mode="REQUIRED"),  # Unique ID for each classification entry
-                    bigquery.SchemaField("question", "STRING", mode="REQUIRED"),  # The original question text
-                    bigquery.SchemaField("question_type", "STRING", mode="REQUIRED"),  # The classified question type
-                    bigquery.SchemaField("confidence", "FLOAT", mode="REQUIRED"),  # Confidence score of classification
-                    bigquery.SchemaField("requires_sql", "BOOLEAN", mode="REQUIRED"),  # Whether SQL generation is needed
-                    bigquery.SchemaField("requires_summary", "BOOLEAN", mode="REQUIRED"),  # Whether summary generation is needed
-                    bigquery.SchemaField("classification_metadata", "STRING", mode="NULLABLE"),  # Additional classification metadata as JSON
-                    bigquery.SchemaField("session_id", "STRING", mode="NULLABLE"),  # Associated session ID if any
-                    bigquery.SchemaField("created_at", "TIMESTAMP", mode="REQUIRED"),  # When the classification was created
-                    bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED")   # When the classification was last updated
-                ]
-                
-                # Create table
-                table = bigquery.Table(classifications_table_id, schema=schema)
-                
-                try:
-                    self.client.create_table(table)
-                    print(f"Created question classifications table {classifications_table_id}")
-                    
-                    # Add to schema cache
-                    self.schema_cache["question_classifications"] = schema
-                except Exception as create_error:
-                    print(f"Error creating question classifications table: {str(create_error)}")
-                    raise
-                
-        except Exception as e:
-            print(f"Error ensuring question classifications table exists: {str(e)}")
-            raise
-    
     def get_question_classification(self, question: str) -> Optional[Dict[str, Any]]:
         """Get an existing classification for a question if available"""
         query = f"""
@@ -798,5 +955,155 @@ class BigQueryClient:
         except Exception as e:
             print(f"Error ensuring question categories table exists: {str(e)}")
             raise
+
+    def _ensure_question_classifications_table_exists(self):
+        """Ensure the question_classifications table exists, create it if it doesn't"""
+        try:
+            # Check if classifications table exists
+            classifications_table_id = self.tables["question_classifications"]
+            table_exists = False
+            
+            try:
+                self.client.get_table(classifications_table_id)
+                print(f"Question classifications table {classifications_table_id} exists")
+                table_exists = True
+            except Exception as e:
+                print(f"Question classifications table {classifications_table_id} does not exist, creating it...")
+                table_exists = False
+            
+            if not table_exists:
+                # Define schema for classifications table
+                schema = [
+                    bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
+                    bigquery.SchemaField("question", "STRING", mode="REQUIRED"),
+                    bigquery.SchemaField("question_type", "STRING", mode="REQUIRED"),
+                    bigquery.SchemaField("confidence", "FLOAT64", mode="REQUIRED"),
+                    bigquery.SchemaField("requires_sql", "BOOLEAN", mode="REQUIRED"),
+                    bigquery.SchemaField("requires_summary", "BOOLEAN", mode="REQUIRED"),
+                    bigquery.SchemaField("classification_metadata", "STRING", mode="NULLABLE"),
+                    bigquery.SchemaField("session_id", "STRING", mode="NULLABLE"),
+                    bigquery.SchemaField("created_at", "TIMESTAMP", mode="REQUIRED"),
+                    bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED")
+                ]
+                
+                # Create table
+                table = bigquery.Table(classifications_table_id, schema=schema)
+                
+                try:
+                    self.client.create_table(table)
+                    print(f"Created question classifications table {classifications_table_id}")
+                except Exception as create_error:
+                    print(f"Error creating question classifications table: {str(create_error)}")
+                    raise
+                
+        except Exception as e:
+            print(f"Error ensuring question classifications table exists: {str(e)}")
+            raise
+
+    def query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        Wrapper for execute_query method - used by MCPQueryExecutor
+        
+        Args:
+            query: SQL query to execute
+            params: Query parameters
+            
+        Returns:
+            List of dictionaries containing the query results
+        """
+        print(f"\n===== QUERY METHOD CALLED =====")
+        print(f"SQL: {query[:200]}...")
+        print(f"Parameters received: {json.dumps(params, indent=2, default=str) if params else 'None'}")
+        
+        # Parameter validation
+        if params:
+            # Extract parameter names from the query
+            import re
+            param_pattern = r'@([a-zA-Z0-9_]+)'
+            params_in_sql = re.findall(param_pattern, query)
+            
+            print(f"Parameters referenced in SQL: {params_in_sql}")
+            
+            # Check if all needed parameters are provided
+            for key, value in params.items():
+                print(f"Parameter key: {key}, value: {value}, type: {type(value)}")
+                
+                # Check if the parameter is referenced in the query
+                if f"@{key}" not in query:
+                    print(f"WARNING: Parameter {key} is not referenced in the query (@{key} not found)")
+            
+            # Check if any parameters in the query are missing
+            missing_params = [p for p in params_in_sql if p not in params]
+            if missing_params:
+                print(f"WARNING: Missing required parameters referenced in the query: {missing_params}")
+                
+        # Configure job directly
+        print(f"Creating job config with parameters directly in query method")
+        job_config = bigquery.QueryJobConfig()
+        query_params = []
+        
+        if params:
+            for name, value in params.items():
+                print(f"Setting parameter {name}={value} ({type(value)})")
+                if isinstance(value, list):
+                    param = bigquery.ArrayQueryParameter(name, "STRING", value)
+                    print(f"Created ArrayQueryParameter: {name}={value}")
+                else:
+                    # Handle scalar parameters based on their type
+                    if isinstance(value, (datetime, date)):
+                        param = bigquery.ScalarQueryParameter(name, "DATE", value)
+                        print(f"Created DATE parameter {name}: {value}")
+                    elif isinstance(value, int):
+                        param = bigquery.ScalarQueryParameter(name, "INT64", value)
+                        print(f"Created INT64 parameter {name}: {value}")
+                    elif isinstance(value, float):
+                        param = bigquery.ScalarQueryParameter(name, "FLOAT64", value)
+                        print(f"Created FLOAT64 parameter {name}: {value}")
+                    else:
+                        # Convert to string for all other types
+                        string_value = str(value)
+                        param = bigquery.ScalarQueryParameter(name, "STRING", string_value)
+                        print(f"Created STRING parameter {name}: {string_value}")
+                
+                query_params.append(param)
+            
+            job_config.query_parameters = query_params
+            print(f"Set {len(query_params)} parameters on job_config")
+            
+            # Print the job_config for debugging
+            print(f"Job config: {job_config}")
+            print(f"Job config parameters: {job_config.query_parameters}")
+        
+        # Execute query directly
+        try:
+            # Log what we're doing
+            print(f"Executing query DIRECTLY with client.query and job_config")
+            
+            # Execute query
+            query_job = self.client.query(query, job_config=job_config)
+            print(f"Query job created: {query_job.job_id}")
+            
+            # Wait for results
+            print(f"Waiting for results...")
+            results = list(query_job.result())
+            print(f"Query returned {len(results)} rows")
+            
+            # Convert to list of dictionaries
+            result_dicts = [dict(row.items()) for row in results]
+            
+            # Debug output
+            if result_dicts:
+                print(f"First result row: {json.dumps(result_dicts[0], default=str)}")
+            
+            return result_dicts
+            
+        except Exception as e:
+            print(f"Error in direct query execution: {e}")
+            print(f"Error type: {type(e)}")
+            print(f"Error traceback: {traceback.format_exc()}")
+            
+            # Try execute_query as a fallback
+            print(f"Trying execute_query as a fallback")
+            return self.execute_query(query, params)
 
      

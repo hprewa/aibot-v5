@@ -242,6 +242,7 @@ class MCPSlackAppHome:
                 
                 # Get the summary
                 summary = response_data.summary or "No response was generated."
+                print(f"Response summary received from router: '{summary[:100]}...'")
                 
                 print(f"✅ Successfully processed query. Sending response.")
                 
@@ -254,11 +255,13 @@ class MCPSlackAppHome:
                 })
                 
                 # Send the response
-                self.send_message(
+                print(f"Attempting to send message to channel {channel} (thread: {thread_ts}) with text: '{summary[:100]}...'")
+                send_result = self.send_message(
                     channel=channel,
                     text=summary,
                     thread_ts=thread_ts
                 )
+                print(f"Result of send_message: {json.dumps(send_result)}")
                 
                 # Update reactions
                 if original_ts:
@@ -463,9 +466,26 @@ class MCPSlackAppHome:
                 "Content-Type": "application/json; charset=utf-8"
             }
             
+            # Format the message using blocks for better formatting
+            blocks = []
+            
+            # Split text into chunks if it's too long (Slack has a 3000 character limit per message)
+            MAX_TEXT_LENGTH = 2900  # Leave some room for formatting
+            text_chunks = [text[i:i + MAX_TEXT_LENGTH] for i in range(0, len(text), MAX_TEXT_LENGTH)]
+            
+            for chunk in text_chunks:
+                blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": chunk
+                    }
+                })
+            
             data = {
                 "channel": channel,
-                "text": text
+                "blocks": blocks,
+                "text": text[:MAX_TEXT_LENGTH] + ("..." if len(text) > MAX_TEXT_LENGTH else "")  # Fallback text
             }
             
             # Add thread_ts if provided for threading support
@@ -479,7 +499,24 @@ class MCPSlackAppHome:
             )
             
             if not response.json().get("ok", False):
-                print(f"⚠️ Failed to send message: {response.json().get('error', 'Unknown error')}")
+                error = response.json().get('error', 'Unknown error')
+                print(f"⚠️ Failed to send message: {error}")
+                
+                if error == "invalid_blocks":
+                    # Fallback to plain text if blocks fail
+                    print("Falling back to plain text message")
+                    data = {
+                        "channel": channel,
+                        "text": text[:MAX_TEXT_LENGTH] + ("..." if len(text) > MAX_TEXT_LENGTH else "")
+                    }
+                    if thread_ts:
+                        data["thread_ts"] = thread_ts
+                        
+                    response = requests.post(
+                        "https://slack.com/api/chat.postMessage", 
+                        headers=headers, 
+                        json=data
+                    )
             
             # Return the response data in case caller needs the timestamp
             return response.json()

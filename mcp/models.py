@@ -50,6 +50,7 @@ class ToolCallData(BaseModel):
     sql: Optional[str] = None
     error: Optional[str] = None
     result: Any = None
+    note: Optional[str] = None  # Added to store informational notes about execution (e.g., future date warnings)
 
 class StrategyData(BaseModel):
     """Data model for the generated strategy"""
@@ -66,6 +67,8 @@ class QueryExecutionData(BaseModel):
     results: Dict[str, Any] = Field(default_factory=dict)
     execution_start: datetime = Field(default_factory=datetime.utcnow)
     execution_end: Optional[datetime] = None
+    query: Optional[str] = None  # Added to store the original query
+    constraints: Optional[Dict[str, Any]] = None  # Added to store the constraints
     
 class ResponseData(BaseModel):
     """Data model for the response"""
@@ -143,6 +146,14 @@ class SessionData(BaseModel):
                           (self.execution.tool_calls if self.execution else [])],
             "tool_call_status": json.dumps({tc.name: tc.status for tc in 
                                           (self.execution.tool_calls if self.execution else [])}, 
+                                         cls=DateTimeEncoder),
+            "tool_call_notes": json.dumps({tc.name: tc.note for tc in 
+                                         (self.execution.tool_calls if self.execution else []) 
+                                         if hasattr(tc, 'note') and tc.note}, 
+                                        cls=DateTimeEncoder),
+            "tool_call_errors": json.dumps({tc.name: tc.error for tc in 
+                                          (self.execution.tool_calls if self.execution else []) 
+                                          if hasattr(tc, 'error') and tc.error}, 
                                          cls=DateTimeEncoder),
             "tool_call_results": json.dumps(self.execution.results if self.execution else None, cls=DateTimeEncoder),
             "results": json.dumps(self.execution.results if self.execution else None, cls=DateTimeEncoder),

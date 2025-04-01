@@ -9,7 +9,6 @@ import dspy
 from typing import List, Dict, Any, Optional
 from datetime import date, datetime
 
-
 class KPITable(dspy.Signature):
     """Base class for all KPI tables"""
     pass
@@ -26,142 +25,141 @@ class KPIQueryBuilder:
         """Build a SQL query based on parameters"""
         raise NotImplementedError("Subclasses must implement build_query")
 
-class OrdersTable(dspy.Signature):
+class OrdersTable(KPITable):
     """
     DSPy table definition for the orders_drt table.
     
     This table contains aggregated order data with the following structure:
-    - delivery_date (DATE): The actual date on which the orders were delivered. Used for daily aggregations.
-    - week_date (DATE): The Monday of the week in which the delivery occurred. Used for weekly aggregations.
-    - cfc (STRING): The name of the Customer Fulfillment Center (CFC). Each CFC has multiple spokes.
-    - spoke (STRING): The name of the spoke, which is associated with a CFC.
-    - orders (INTEGER): The total number of orders for the given delivery_date, cfc, and spoke.
+    - delivery_date (DATE): The actual date on which the orders were delivered
+    - week_date (DATE): The Monday of the week in which the delivery occurred
+    - cfc (STRING): The name of the Customer Fulfillment Center
+    - spoke (STRING): The name of the spoke, which is associated with a CFC
+    - orders (INTEGER): The total number of orders
     """
     
-    # Column definitions using InputField and OutputField
     delivery_date: date = dspy.InputField(description="The actual date on which the orders were delivered")
     week_date: date = dspy.InputField(description="The Monday of the week in which the delivery occurred")
     cfc: str = dspy.InputField(description="The name of the Customer Fulfillment Center")
     spoke: str = dspy.InputField(description="The name of the spoke, which is associated with a CFC")
-    orders: int = dspy.OutputField(description="The total number of orders for the given delivery_date, cfc, and spoke")
+    orders: int = dspy.OutputField(description="The total number of orders")
 
-
-class OrdersQueryBuilder:
-    """
-    Query builder for the orders_drt table.
+class OrdersQueryBuilder(KPIQueryBuilder):
+    """Query builder for the orders_drt table"""
     
-    This class provides methods for building SQL queries for the orders_drt table.
-    """
-    
-    # Table name
-    _table_name = "text-to-sql-dev.chatbotdb.orders_drt"
-
     def __init__(self):
         super().__init__()
         self.table_class = OrdersTable
         self._table_name = "orders_drt"
         self.project_id = "text-to-sql-dev"
         self.dataset_id = "chatbotdb"
-
     
-
-    
-    @staticmethod
-    def get_date_column_for_aggregation(aggregation_type: str) -> str:
+    def build_query(self, **params) -> str:
         """
-        Get the appropriate date column for the specified aggregation type.
-        
-        Args:
-            aggregation_type: The type of aggregation ('daily', 'weekly', or 'monthly')
+        Build a SQL query for orders data based on parameters
+        """
+        try:
+            print(f"\nBuilding orders query with parameters: {params}")
             
-        Returns:
-            The column name to use for date filtering and grouping
-        """
-        if aggregation_type == 'daily':
-            return 'delivery_date'
-        elif aggregation_type == 'weekly':
+            # Validate required parameters
+            if 'start_date' not in params or 'end_date' not in params:
+                raise ValueError("start_date and end_date are required parameters")
+            
+            # Get date column based on aggregation
+            date_col = self._get_date_column(params.get('aggregation', 'daily'))
+            print(f"Using date column: {date_col}")
+            
+            # Build location filter
+            location_filter = self._build_location_filter(params)
+            print(f"Location filter: {location_filter}")
+            
+            # Build group by clause
+            group_by = self._build_group_by(params)
+            print(f"Group by clause: {group_by}")
+            
+            # Build the query
+            query = f"""
+            WITH location_data AS (
+                SELECT 
+                    o.*,
+                    COALESCE(LOWER(m.cfc), LOWER(o.cfc)) as normalized_cfc,
+                    LOWER(m.spoke) as normalized_spoke,
+                    COALESCE(m.cfc, o.cfc) as display_cfc,
+                    m.spoke as display_spoke
+                FROM `{self.project_id}.{self.dataset_id}.{self._table_name}` o
+                LEFT JOIN `{self.project_id}.{self.dataset_id}.cfc_spoke_mapping` m
+                ON LOWER(o.cfc) = LOWER(m.spoke)
+                WHERE DATE({date_col}) BETWEEN DATE(@start_date) AND DATE(@end_date)
+            )
+            SELECT 
+                {date_col} as delivery_date,
+                {self._build_select_columns(params)},
+                SUM(orders) as total_orders
+            FROM location_data
+            WHERE {location_filter}
+            GROUP BY {date_col}, {group_by}
+            ORDER BY {date_col}
+            """
+            
+            print(f"\nGenerated query:\n{query}")
+            return query.strip()
+            
+        except Exception as e:
+            print(f"Error building orders query: {str(e)}")
+            raise
+    
+    def _get_date_column(self, aggregation: str) -> str:
+        """Get the appropriate date column for aggregation"""
+        if aggregation == 'weekly':
             return 'week_date'
-        elif aggregation_type == 'monthly':
-            return 'delivery_date'  # For monthly, we'll use EXTRACT in the query
+        elif aggregation == 'monthly':
+            return 'DATE_TRUNC(delivery_date, MONTH)'
         else:
-            return 'delivery_date'  # Default to delivery_date
+            return 'delivery_date'
     
-    @staticmethod
-    def build_query(
-        aggregation_type: str,
-        start_date: str,
-        end_date: str,
-        cfc: Optional[List[str]] = None,
-        spoke: Optional[List[str]] = None,
-        group_by_fields: Optional[List[str]] = None
-    ) -> str:
-        """
-        Build a SQL query for the orders_drt table based on the provided parameters.
+    def _build_location_filter(self, params: Dict[str, Any]) -> str:
+        """Build the location filter clause"""
+        filters = []
         
-        Args:
-            aggregation_type: The type of aggregation ('daily', 'weekly', or 'monthly')
-            start_date: The start date for filtering (inclusive)
-            end_date: The end date for filtering (inclusive)
-            cfc: Optional list of CFCs to filter by
-            spoke: Optional list of spokes to filter by
-            group_by_fields: Optional list of fields to group by
+        if 'cfc' in params and params['cfc']:
+            if isinstance(params['cfc'], list):
+                # For list of CFCs, use IN clause with case-insensitive comparison
+                filters.append(f"normalized_cfc IN UNNEST(@cfc)")
+            else:
+                # For single CFC, use direct comparison
+                filters.append(f"normalized_cfc = @cfc")
+                
+        if 'spoke' in params and params['spoke'] and params['spoke'] != 'all':
+            if isinstance(params['spoke'], list):
+                # For list of spokes, use IN clause with case-insensitive comparison
+                filters.append(f"normalized_spoke IN UNNEST(@spoke)")
+            else:
+                # For single spoke, use direct comparison
+                filters.append(f"normalized_spoke = @spoke")
             
-        Returns:
-            A SQL query string
-        """
-        # Determine the date column for filtering and grouping
-        date_column = OrdersQueryBuilder.get_date_column_for_aggregation(aggregation_type)
+        print(f"Built location filters: {filters}")
+        return ' AND '.join(filters) if filters else '1=1'
+    
+    def _build_select_columns(self, params: Dict[str, Any]) -> str:
+        """Build the columns to select"""
+        columns = []
         
-        # Build the SELECT clause
-        select_clause = []
-        group_by_clause = []
+        if 'cfc' in params and params['cfc']:
+            columns.append('display_cfc as cfc')
+        if 'spoke' in params and params['spoke'] and params['spoke'] != 'all':
+            columns.append('display_spoke as spoke')
+            
+        return ', '.join(columns) if columns else 'display_cfc as cfc'
+    
+    def _build_group_by(self, params: Dict[str, Any]) -> str:
+        """Build the group by clause"""
+        group_by = []
         
-        if aggregation_type == 'daily':
-            select_clause.append(f"{date_column} AS date")
-            group_by_clause.append(date_column)
-        elif aggregation_type == 'weekly':
-            select_clause.append(f"{date_column} AS week_start_date")
-            group_by_clause.append(date_column)
-        elif aggregation_type == 'monthly':
-            select_clause.append(f"EXTRACT(YEAR FROM {date_column}) AS year")
-            select_clause.append(f"EXTRACT(MONTH FROM {date_column}) AS month")
-            group_by_clause.append(f"EXTRACT(YEAR FROM {date_column})")
-            group_by_clause.append(f"EXTRACT(MONTH FROM {date_column})")
-        
-        # Add CFC and/or spoke to SELECT and GROUP BY if needed
-        if group_by_fields:
-            for field in group_by_fields:
-                if field not in group_by_clause and field in ['cfc', 'spoke']:
-                    select_clause.append(field)
-                    group_by_clause.append(field)
-        
-        # Always include the sum of orders
-        select_clause.append("SUM(orders) AS total_orders")
-        
-        # Build the WHERE clause
-        where_conditions = [f"{date_column} BETWEEN '{start_date}' AND '{end_date}'"]
-        
-        if cfc:
-            cfc_list = "', '".join(cfc)
-            where_conditions.append(f"cfc IN ('{cfc_list}')")
-        
-        # Only add spoke filter if spoke list is not empty
-        if spoke and isinstance(spoke, list):
-            spoke_list = "', '".join(spoke)
-            where_conditions.append(f"spoke IN ('{spoke_list}')")
-        
-        # Construct the final query
-        query = f"""
-        SELECT {', '.join(select_clause)}
-        FROM `{OrdersQueryBuilder._table_name}`
-        WHERE {' AND '.join(where_conditions)}
-        GROUP BY {', '.join(group_by_clause)}
-        ORDER BY {', '.join(group_by_clause)}
-        """
-        
-        return query
-
-# Add more table definitions for other KPIs here 
+        if 'cfc' in params and params['cfc']:
+            group_by.append('display_cfc')
+        if 'spoke' in params and params['spoke'] and params['spoke'] != 'all':
+            group_by.append('display_spoke')
+            
+        return ', '.join(group_by) if group_by else 'display_cfc'
 
 class ATPTable(KPITable):
     """

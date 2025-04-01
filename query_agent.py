@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional, Union
 import dspy
 from dspy_tables import OrdersTable, OrdersQueryBuilder
 from gemini_client import GeminiClient
+import traceback
 
 class QueryAgent:
     """
@@ -99,7 +100,7 @@ class QueryAgent:
         # Default to unknown
         return "unknown"
     
-    def _handle_orders_query(self, tool_call: Dict[str, Any], constraints: Dict[str, Any]) -> str:
+    def _handle_orders_query(self, tool_call: Dict[str, Any], constraints: Dict[str, Any]) -> Optional[str]:
         """
         Handle queries for the orders KPI using the OrdersTable DSPy definition.
         
@@ -108,81 +109,114 @@ class QueryAgent:
             constraints: The constraints extracted from the user's question
             
         Returns:
-            A SQL query string
+            A SQL query string or None if an error occurs.
         """
-        print(f"\nGenerating orders query with:")
-        print(f"Tool call: {json.dumps(tool_call, indent=2)}")
-        print(f"Constraints: {json.dumps(constraints, indent=2)}")
-        
-        # Extract parameters from constraints and tool call
-        time_filter = constraints.get("time_filter", {})
-        start_date = time_filter.get("start_date", "")
-        end_date = time_filter.get("end_date", "")
-        
-        # Determine aggregation type
-        aggregation_type = self._determine_aggregation_type(tool_call, constraints)
-        print(f"Using aggregation type: {aggregation_type}")
-        
-        # Extract location filters
-        cfc = constraints.get("cfc", [])
-        spokes = constraints.get("spokes", [])
-        print(f"Location filters - CFC: {cfc}, Spokes: {spokes}")
-        
-        # Determine group by fields
-        group_by_fields = self._determine_group_by_fields(tool_call, constraints)
-        print(f"Group by fields: {group_by_fields}")
-        
-        # Handle different types of comparisons
-        comparison_type = constraints.get("comparison_type")
-        if comparison_type:
-            # Extract the specific location to compare from the tool call name
-            tool_call_name = tool_call.get("name", "").lower()
+        try:
+            print(f"\nGenerating orders query with:")
+            print(f"Tool call: {json.dumps(tool_call, indent=2)}")
+            print(f"Constraints: {json.dumps(constraints, indent=2)}")
             
-            # For location comparisons, filter based on the specific location in the tool call name
+            # Extract parameters from constraints and tool call
+            time_filter = constraints.get("time_filter", {})
+            start_date = time_filter.get("start_date", "")
+            end_date = time_filter.get("end_date", "")
+            
+            # Determine aggregation type
+            aggregation_type = self._determine_aggregation_type(tool_call, constraints)
+            print(f"Using aggregation type: {aggregation_type}")
+            
+            # Extract location filters
+            cfc = constraints.get("cfc", [])
+            spokes = constraints.get("spokes", [])
+            print(f"Location filters - CFC: {cfc}, Spokes: {spokes}")
+
+            # Determine group by fields based *only* on the tool call description/name if needed
+            # We avoid grouping by the full list of constraints['cfc'] during comparisons.
+            group_by_fields = []
+            tool_call_desc = tool_call.get("description", "").lower()
+            tool_call_name = tool_call.get("name", "").lower()
+            # Example: Group by CFC if the tool call explicitly asks for CFC-level aggregation
+            if "cfc" in tool_call_desc or "cfc" in tool_call_name:
+                 # Check if 'spoke' is also mentioned for grouping - unlikely for comparisons?
+                 if "spoke" in tool_call_desc or "spoke" in tool_call_name:
+                      group_by_fields.append("spoke")
+                 else: # Default to grouping by cfc if mentioned
+                      group_by_fields.append("cfc")
+            # Only add spoke grouping if explicitly requested in the tool call itself
+            elif "spoke" in tool_call_desc or "spoke" in tool_call_name:
+                 group_by_fields.append("spoke")
+
+            print(f"Group by fields determined from tool call: {group_by_fields}")
+
+            # Handle different types of comparisons - Filter location based on THIS tool call
+            comparison_type = constraints.get("comparison_type")
+            cfc_filter_for_this_call = []
+            spokes_filter_for_this_call = []
+
             if comparison_type == "between_locations":
-                # Extract location from tool call name (e.g., "get_orders_london" -> "london")
-                location = tool_call_name.split("_")[-1] if "_" in tool_call_name else ""
-                
-                if location:
-                    # If comparing CFCs
-                    if constraints.get("location_type") == "CFC":
-                        cfc_filter = [location]
-                        spokes_filter = []
-                    # If comparing spokes
-                    elif constraints.get("location_type") == "Spoke":
-                        cfc_filter = cfc  # Keep all CFCs
-                        spokes_filter = [location]
-                    # If comparing CFC vs Spoke
-                    else:
-                        # Check if the location is a CFC or spoke
-                        if location in cfc:
-                            cfc_filter = [location]
-                            spokes_filter = []
+                # Extract the specific location from this specific tool call name/description
+                # Example: "get_stevenage_orders_jan_2024" -> target "stevenage"
+                target_location = None
+                # A simple heuristic: check if known CFCs/spokes are in the name
+                known_locations = cfc + (spokes if isinstance(spokes, list) else []) # Combine known CFCs/spokes
+                for loc in known_locations:
+                    if loc in tool_call_name:
+                         target_location = loc
+                         break # Take the first match
+
+                if target_location:
+                    print(f"Identified target location '{target_location}' for tool call '{tool_call_name}'")
+                    # Determine if the target is a CFC or Spoke (using original constraints list for lookup)
+                    if target_location in cfc:
+                        cfc_filter_for_this_call = [target_location]
+                        # Ensure spokes are empty unless explicitly grouped by spoke in this tool call
+                        if "spoke" not in group_by_fields:
+                            spokes_filter_for_this_call = [] # Override if not grouping by spoke
                         else:
-                            cfc_filter = cfc
-                            spokes_filter = [location]
+                            # If grouping by spoke, we might need all spokes for that CFC (TBD if needed)
+                            spokes_filter_for_this_call = [] # Default to empty for now
+                    elif isinstance(spokes, list) and target_location in spokes:
+                         # If the target is a spoke, we usually need its parent CFC too for some queries
+                         # Find the parent CFC for this spoke from the mapping (requires BQ client access or cached map)
+                         # For simplicity here, let's assume the builder handles this or we pass the single spoke
+                         spokes_filter_for_this_call = [target_location]
+                         # Keep the original CFC list from constraints *unless* grouping is only by spoke
+                         if "cfc" in group_by_fields:
+                              cfc_filter_for_this_call = cfc # Keep original CFC list if grouping by CFC
+                         else:
+                              cfc_filter_for_this_call = [] # Clear CFC filter if only grouping by spoke
+                    else:
+                         # If target location not clearly identified as CFC/Spoke, fallback
+                         print(f"Warning: Could not determine type for target location '{target_location}'. Falling back.")
+                         cfc_filter_for_this_call = cfc # Fallback to original list
+                         spokes_filter_for_this_call = spokes if isinstance(spokes, list) else []
                 else:
-                    cfc_filter = cfc
-                    spokes_filter = spokes
+                    print(f"Warning: Could not identify single target location from tool call name '{tool_call_name}'. Falling back.")
+                    # Fallback if location cannot be extracted from tool call name
+                    cfc_filter_for_this_call = cfc
+                    spokes_filter_for_this_call = spokes if isinstance(spokes, list) else []
             else:
-                cfc_filter = cfc
-                spokes_filter = spokes
-        else:
-            cfc_filter = cfc
-            spokes_filter = spokes
-        
-        # Use the OrdersQueryBuilder to build the query
-        query = OrdersQueryBuilder.build_query(
-            aggregation_type=aggregation_type,
-            start_date=start_date,
-            end_date=end_date,
-            cfc=cfc_filter,
-            spoke=spokes_filter,
-            group_by_fields=group_by_fields
-        )
-        
-        print(f"\nGenerated SQL query:\n{query}")
-        return query
+                 # Not a location comparison, use filters from main constraints
+                 cfc_filter_for_this_call = cfc
+                 spokes_filter_for_this_call = spokes if isinstance(spokes, list) else []
+
+            # Use the OrdersQueryBuilder to build the query with SPECIFIC filters for this call
+            query = OrdersQueryBuilder().build_query(
+                aggregation_type=aggregation_type,
+                start_date=start_date,
+                end_date=end_date,
+                cfc=cfc_filter_for_this_call, # Use filtered list for this specific call
+                spoke=spokes_filter_for_this_call, # Use filtered list for this specific call
+                group_by_fields=group_by_fields
+            )
+            
+            print(f"\nGenerated SQL query:\n{query}")
+            return query
+            
+        except Exception as e:
+            print(f"!!! Error generating orders query: {str(e)}")
+            traceback.print_exc() # Print full traceback for debugging
+            return None # Return None to indicate failure
     
     def _determine_aggregation_type(self, tool_call: Dict[str, Any], constraints: Dict[str, Any]) -> str:
         """
@@ -218,29 +252,6 @@ class QueryAgent:
         
         # Default to daily
         return "daily"
-    
-    def _determine_group_by_fields(self, tool_call: Dict[str, Any], constraints: Dict[str, Any]) -> List[str]:
-        """
-        Determine the fields to group by based on the tool call and constraints.
-        
-        Args:
-            tool_call: The tool call definition
-            constraints: The constraints extracted from the user's question
-            
-        Returns:
-            A list of field names to group by
-        """
-        group_by_fields = []
-        
-        # Check if we need to group by CFC
-        if constraints.get("location_type") == "CFC" or "cfc" in tool_call.get("description", "").lower():
-            group_by_fields.append("cfc")
-        
-        # Check if we need to group by spoke
-        if constraints.get("location_type") == "Spoke" or "spoke" in tool_call.get("description", "").lower():
-            group_by_fields.append("spoke")
-        
-        return group_by_fields
     
     def _generate_query_with_gemini(self, kpi_type: str, tool_call: Dict[str, Any], constraints: Dict[str, Any]) -> str:
         """

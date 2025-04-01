@@ -12,6 +12,7 @@ import traceback
 from datetime import datetime
 import uuid
 import logging
+import re
 
 from .protocol import Context, ContextProcessor, ContextMetadata
 from .models import (
@@ -214,8 +215,19 @@ class MCPQueryExecutor(ContextProcessor):
             # Extract the execution data
             execution_data = context.data
             
+            # Add query field from parent context if available
+            if not hasattr(execution_data, 'query') and context.metadata.parent_id:
+                # Try to get query from the parent context
+                from mcp.protocol import Context
+                parent_context = Context.get_context(context.metadata.parent_id)
+                if parent_context and hasattr(parent_context.data, 'question'):
+                    execution_data.query = parent_context.data.question
+            
             # Set execution start time
             execution_data.execution_start = datetime.now()
+            
+            # Check data availability in the database
+            available_date_range = self._get_data_availability()
             
             # Execute each query
             for tool_call in execution_data.tool_calls:
@@ -229,8 +241,404 @@ class MCPQueryExecutor(ContextProcessor):
                         self.logger.info(f"\nExecuting query for tool call {tool_call.name}:")
                         self.logger.info(f"SQL: {tool_call.sql}")
                         
+                        # Extract parameters from the SQL query
+                        param_pattern = r'@([a-zA-Z0-9_]+)'
+                        params_in_sql = re.findall(param_pattern, tool_call.sql)
+                        self.logger.info(f"Parameters referenced in SQL: {params_in_sql}")
+                        
+                        # Extract constraints if available to use for parameters
+                        params = {}
+                        if hasattr(execution_data, 'constraints') and execution_data.constraints:
+                            constraints = execution_data.constraints
+                            self.logger.info(f"Extracting parameters from constraints: {constraints}")
+                            
+                            # Extract parameters from constraints
+                            if isinstance(constraints, dict):
+                                # Handle time filter parameters
+                                if 'time_filter' in constraints and isinstance(constraints['time_filter'], dict):
+                                    time_filter = constraints['time_filter']
+                                    if 'start_date' in time_filter and 'start_date' in params_in_sql:
+                                        params['start_date'] = time_filter['start_date']
+                                    if 'end_date' in time_filter and 'end_date' in params_in_sql:
+                                        params['end_date'] = time_filter['end_date']
+                                
+                                # Handle location parameters
+                                if 'cfc' in constraints and 'cfc' in params_in_sql:
+                                    params['cfc'] = constraints['cfc']
+                                if 'spokes' in constraints and 'spoke' in params_in_sql:
+                                    params['spoke'] = constraints['spokes']
+                            else:
+                                # Try to access dictionary methods if available
+                                if hasattr(constraints, 'get'):
+                                    time_filter = constraints.get('time_filter', {})
+                                    if hasattr(time_filter, 'get'):
+                                        if 'start_date' in params_in_sql:
+                                            params['start_date'] = time_filter.get('start_date')
+                                        if 'end_date' in params_in_sql:
+                                            params['end_date'] = time_filter.get('end_date')
+                                    
+                                    if 'cfc' in params_in_sql:
+                                        params['cfc'] = constraints.get('cfc')
+                                    if 'spoke' in params_in_sql:
+                                        params['spoke'] = constraints.get('spokes')
+                            
+                            self.logger.info(f"Parameters extracted from constraints: {params}")
+                            
+                        # Try to extract parameters from the tool call as a fallback
+                        if tool_call.name and any(p not in params for p in params_in_sql):
+                            self.logger.info(f"Extracting additional parameters from tool call name: {tool_call.name}")
+                            # Look for date patterns in the tool call name
+                            if 'start_date' in params_in_sql and 'start_date' not in params:
+                                # Look for year patterns like "2023" or "jan_2023"
+                                year_matches = re.findall(r'(\d{4})', tool_call.name)
+                                month_matches = re.findall(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)(?:_|-)(\d{4})', tool_call.name.lower())
+                                
+                                if month_matches:
+                                    month_dict = {'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04', 'may': '05', 'jun': '06',
+                                                 'jul': '07', 'aug': '08', 'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12'}
+                                    month, year = month_matches[0]
+                                    start_date = f"{year}-{month_dict[month]}-01"
+                                    params['start_date'] = start_date
+                                    # Set end_date to the end of the month if not already set
+                                    if 'end_date' in params_in_sql and 'end_date' not in params:
+                                        month_int = int(month_dict[month])
+                                        year_int = int(year)
+                                        # Get next month
+                                        if month_int == 12:
+                                            next_month = 1
+                                            next_year = year_int + 1
+                                        else:
+                                            next_month = month_int + 1
+                                            next_year = year_int
+                                        # Last day is one day before first day of next month
+                                        end_date = f"{year if month_int < 12 else year_int+1}-{next_month:02d}-01"
+                                        from datetime import datetime, timedelta
+                                        end_date_obj = datetime.strptime(end_date, '%Y-%m-%d') - timedelta(days=1)
+                                        params['end_date'] = end_date_obj.strftime('%Y-%m-%d')
+                                    
+                                elif year_matches and 'start_date' not in params:
+                                    year = year_matches[0]
+                                    params['start_date'] = f"{year}-01-01"
+                                    if 'end_date' in params_in_sql and 'end_date' not in params:
+                                        params['end_date'] = f"{year}-12-31"
+                            
+                            # Look for location patterns like "london" or "stevenage"
+                            if 'cfc' in params_in_sql and 'cfc' not in params:
+                                location_matches = re.findall(r'(london|stevenage|bristol|dordon|hatfield)', tool_call.name.lower())
+                                if location_matches:
+                                    params['cfc'] = [location_matches[0]]
+                            
+                            self.logger.info(f"Parameters after extraction from tool call: {params}")
+                        
+                        # Check if we have all required parameters
+                        missing_params = [p for p in params_in_sql if p not in params or params[p] is None]
+                        if missing_params:
+                            self.logger.error(f"Missing required parameters: {missing_params}")
+                            tool_call.status = "failed"
+                            tool_call.error = f"Missing required parameters: {missing_params}"
+                            continue
+                        
                         # Execute query and get results
-                        results = self.bigquery_client.query(tool_call.sql)
+                        self.logger.info(f"Executing query with parameters: {params}")
+                        self.logger.info(f"SQL QUERY EXECUTION START -----------------")
+                        try:
+                            # EXPLICITLY TRACE THE PROCESS
+                            self.logger.info(f"ABOUT TO CALL execute_query with SQL: {tool_call.sql[:100]}...")
+                            self.logger.info(f"Parameters that will be sent: {json.dumps(params, default=str)}")
+                            
+                            # Convert constraints object to dict if needed
+                            if hasattr(execution_data, 'constraints') and not isinstance(execution_data.constraints, dict):
+                                if hasattr(execution_data.constraints, 'dict'):
+                                    params_from_dict = execution_data.constraints.dict()
+                                    if 'time_filter' in params_from_dict and isinstance(params_from_dict['time_filter'], dict):
+                                        if 'start_date' in params_from_dict['time_filter']:
+                                            params['start_date'] = params_from_dict['time_filter']['start_date']
+                                        if 'end_date' in params_from_dict['time_filter']:
+                                            params['end_date'] = params_from_dict['time_filter']['end_date']
+                                    if 'cfc' in params_from_dict:
+                                        params['cfc'] = params_from_dict['cfc']
+                                    self.logger.info(f"Updated parameters from constraints dict: {json.dumps(params, default=str)}")
+                            
+                            # Add a direct debug command call
+                            import inspect
+                            self.logger.info(f"BigQueryClient class structure: {inspect.getmembers(self.bigquery_client)}")
+                            self.logger.info(f"Does execute_query exist? {'execute_query' in dir(self.bigquery_client)}")
+                            
+                            # DIRECT CALL TO EXECUTE THE QUERY - try both methods
+                            try:
+                                # Add special debug info to verify parameters
+                                self.logger.info(f"\n*** DEBUG: ABOUT TO EXECUTE QUERY ***")
+                                self.logger.info(f"Parameters being passed: {json.dumps(params, default=str)}")
+                                
+                                # Verify job_config creation and parameter attachment
+                                from google.cloud import bigquery
+                                job_config = bigquery.QueryJobConfig()
+                                query_params = []
+                                for name, value in params.items():
+                                    self.logger.info(f"Setting parameter {name}={value} ({type(value)})")
+                                    if isinstance(value, list):
+                                        param = bigquery.ArrayQueryParameter(name, "STRING", value)
+                                        self.logger.info(f"Created ArrayQueryParameter: {name}={value}")
+                                    else:
+                                        param = bigquery.ScalarQueryParameter(name, "STRING", str(value))
+                                        self.logger.info(f"Created ScalarQueryParameter: {name}={value}")
+                                    query_params.append(param)
+                                
+                                # Set parameters on job_config
+                                job_config.query_parameters = query_params
+                                self.logger.info(f"Set {len(query_params)} parameters on job_config")
+                                
+                                # Test the parameters with the BigQuery client directly
+                                self.logger.info(f"*** DIRECT BIGQUERY TEST WITH PARAMETERS ***")
+                                client = bigquery.Client(project="text-to-sql-dev")
+                                # Create simple test query first
+                                test_query = "SELECT @start_date as start, @end_date as end, @cfc[OFFSET(0)] as cfc"
+                                self.logger.info(f"Test query: {test_query}")
+                                test_job = client.query(test_query, job_config=job_config)
+                                test_results = list(test_job.result())
+                                self.logger.info(f"Test query results: {test_results}")
+                                self.logger.info(f"First row: {dict(test_results[0].items()) if test_results else 'No results'}")
+                                
+                                # Now execute the real query with the verified job_config
+                                self.logger.info(f"*** EXECUTING REAL QUERY WITH VERIFIED PARAMETERS ***")
+                                if hasattr(self.bigquery_client, 'execute_query'):
+                                    results = self.bigquery_client.execute_query(tool_call.sql, params)
+                                    self.logger.info("execute_query method was used successfully")
+                                else:
+                                    self.logger.error("execute_query method not found, trying to call query method")
+                                    results = self.bigquery_client.query(tool_call.sql, params)
+                                    self.logger.info("query method was used successfully")
+                            except Exception as specific_error:
+                                self.logger.error(f"Direct method call failed: {str(specific_error)}")
+                                # Try with client.query as a final attempt
+                                try:
+                                    self.logger.info("\n*** FINAL ATTEMPT - DIRECT BIGQUERY CLIENT ***")
+                                    from google.cloud import bigquery
+                                    
+                                    # Create client with specific project
+                                    project_id = "text-to-sql-dev"
+                                    self.logger.info(f"Creating BigQuery client with project_id={project_id}")
+                                    client = bigquery.Client(project=project_id)
+                                    
+                                    # Set up job configuration
+                                    self.logger.info(f"Creating job configuration with parameters")
+                                    job_config = bigquery.QueryJobConfig()
+                                    query_params = []
+                                    
+                                    # Debug the SQL query
+                                    self.logger.info(f"SQL query to execute:\n{tool_call.sql}")
+                                    
+                                    # Process parameters
+                                    for name, value in params.items():
+                                        self.logger.info(f"Processing parameter {name}={value} ({type(value)})")
+                                        if isinstance(value, list):
+                                            self.logger.info(f"Creating array parameter for {name}")
+                                            # For array parameters (used in IN UNNEST clauses)
+                                            param = bigquery.ArrayQueryParameter(name, "STRING", value)
+                                            self.logger.info(f"Created array parameter: {name} = {value}")
+                                        else:
+                                            # For scalar parameters based on their type
+                                            if isinstance(value, (datetime, datetime.date)):
+                                                self.logger.info(f"Creating DATE parameter for {name}")
+                                                param = bigquery.ScalarQueryParameter(name, "DATE", value)
+                                            elif isinstance(value, int):
+                                                self.logger.info(f"Creating INT64 parameter for {name}")
+                                                param = bigquery.ScalarQueryParameter(name, "INT64", value)
+                                            elif isinstance(value, float):
+                                                self.logger.info(f"Creating FLOAT64 parameter for {name}")
+                                                param = bigquery.ScalarQueryParameter(name, "FLOAT64", value)
+                                            else:
+                                                self.logger.info(f"Creating STRING parameter for {name}")
+                                                # Convert to string for all other types
+                                                string_value = str(value)
+                                                param = bigquery.ScalarQueryParameter(name, "STRING", string_value)
+                                                self.logger.info(f"Created string parameter: {name} = {string_value}")
+                                        
+                                        query_params.append(param)
+                                    
+                                    # Set parameters on job_config
+                                    job_config.query_parameters = query_params
+                                    self.logger.info(f"Set {len(query_params)} parameters on job_config")
+                                    self.logger.info(f"Job config: {job_config}")
+                                    
+                                    # First run a simple test query to verify parameters
+                                    self.logger.info(f"*** RUNNING TEST QUERY TO VERIFY PARAMETERS ***")
+                                    test_query = "SELECT "
+                                    test_parts = []
+                                    for name in params.keys():
+                                        if isinstance(params[name], list):
+                                            test_parts.append(f"@{name}[OFFSET(0)] as {name}")
+                                        else:
+                                            test_parts.append(f"@{name} as {name}")
+                                    test_query += ", ".join(test_parts)
+                                    
+                                    self.logger.info(f"Test query: {test_query}")
+                                    try:
+                                        test_job = client.query(test_query, job_config=job_config)
+                                        test_results = list(test_job.result())
+                                        self.logger.info(f"Test query succeeded with {len(test_results)} rows")
+                                        if test_results:
+                                            self.logger.info(f"Test result: {dict(test_results[0])}")
+                                    except Exception as test_error:
+                                        self.logger.error(f"Test query failed: {str(test_error)}")
+                                    
+                                    # Execute actual query
+                                    self.logger.info(f"*** EXECUTING ACTUAL QUERY WITH BIGQUERY CLIENT ***")
+                                    self.logger.info(f"SQL: {tool_call.sql}")
+                                    self.logger.info(f"Parameters: {params}")
+                                    
+                                    # Execute query
+                                    query_job = client.query(tool_call.sql, job_config=job_config)
+                                    
+                                    # Log job details
+                                    self.logger.info(f"Query job created - ID: {query_job.job_id}")
+                                    self.logger.info(f"Query job state: {query_job.state}")
+                                    
+                                    # Wait for results
+                                    self.logger.info("Waiting for query results...")
+                                    results = list(query_job.result())
+                                    
+                                    # Convert to dictionaries
+                                    self.logger.info(f"Query returned {len(results)} rows")
+                                    results = [dict(row.items()) for row in results]
+                                    
+                                    # Log sample result
+                                    if results:
+                                        self.logger.info(f"First result row: {results[0]}")
+                                    
+                                    self.logger.info("Direct BigQuery client.query call was successful")
+                                except Exception as direct_error:
+                                    self.logger.error(f"Direct BigQuery client call failed: {str(direct_error)}")
+                                    self.logger.error(f"Error type: {type(direct_error)}")
+                                    self.logger.error(f"Error traceback: {traceback.format_exc()}")
+                                    
+                                    # Log detailed error information
+                                    self.logger.error(f"*** DETAILED ERROR INFORMATION ***")
+                                    self.logger.error(f"Error message: {str(direct_error)}")
+                                    self.logger.error(f"Error class: {direct_error.__class__.__name__}")
+                                    
+                                    # Set detailed error message on tool_call
+                                    error_message = f"BigQuery query execution failed: {str(direct_error)}"
+                                    tool_call.error = error_message
+                                    tool_call.status = "failed"
+                                    
+                                    # LAST RESORT: Try with raw API call
+                                    try:
+                                        self.logger.info("*** ATTEMPTING ABSOLUTE LAST RESORT WITH SUBPROCESS ***")
+                                        import subprocess
+                                        import tempfile
+                                        import os
+                                        
+                                        # Create a temporary file with the SQL and parameters
+                                        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                                            param_json = {
+                                                "query": tool_call.sql,
+                                                "params": params
+                                            }
+                                            json.dump(param_json, f)
+                                            param_file = f.name
+                                        
+                                        # Create a Python script that will execute the query
+                                        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                                            f.write("""
+import json
+import sys
+from google.cloud import bigquery
+
+# Load query and params
+with open(sys.argv[1], 'r') as f:
+    data = json.load(f)
+    
+query = data['query']
+params_dict = data['params']
+
+# Set up BigQuery client
+client = bigquery.Client(project="text-to-sql-dev")
+
+# Set up job config with parameters
+job_config = bigquery.QueryJobConfig()
+query_params = []
+
+# Convert parameters
+for name, value in params_dict.items():
+    if isinstance(value, list):
+        param = bigquery.ArrayQueryParameter(name, "STRING", value)
+    else:
+        param = bigquery.ScalarQueryParameter(name, "STRING", str(value))
+    query_params.append(param)
+
+# Set parameters on job config
+job_config.query_parameters = query_params
+
+# Execute query
+print(f"Executing query with parameters: {params_dict}")
+query_job = client.query(query, job_config=job_config)
+
+# Wait for results and print
+results = list(query_job.result())
+result_list = [dict(row.items()) for row in results]
+print(f"Query returned {len(result_list)} rows")
+if result_list:
+    print(f"First row: {result_list[0]}")
+
+# Write results to file
+with open(sys.argv[2], 'w') as f:
+    json.dump(result_list, f)
+""")
+                                            script_file = f.name
+                                        
+                                        # Create a file for results
+                                        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                                            results_file = f.name
+                                        
+                                        # Run the script
+                                        self.logger.info(f"Running script: {script_file}")
+                                        process = subprocess.run(
+                                            ["python", script_file, param_file, results_file], 
+                                            capture_output=True, 
+                                            text=True
+                                        )
+                                        
+                                        # Log the output
+                                        self.logger.info(f"Script output: {process.stdout}")
+                                        self.logger.info(f"Script errors: {process.stderr}")
+                                        
+                                        # Load results if successful
+                                        if process.returncode == 0 and os.path.exists(results_file):
+                                            with open(results_file, 'r') as f:
+                                                results = json.load(f)
+                                            self.logger.info(f"Loaded {len(results)} results from subprocess")
+                                        else:
+                                            raise Exception(f"Subprocess failed with code {process.returncode}")
+                                        
+                                        # Clean up temp files
+                                        for file in [param_file, script_file, results_file]:
+                                            try:
+                                                os.remove(file)
+                                            except:
+                                                pass
+                                    except Exception as subprocess_error:
+                                        self.logger.error(f"Subprocess execution failed: {str(subprocess_error)}")
+                                        self.logger.error(f"Error type: {type(subprocess_error)}")
+                                        self.logger.error(f"Error traceback: {traceback.format_exc()}")
+                                        
+                                        # Set detailed error message on tool_call
+                                        subprocess_error_msg = f"All execution methods failed. Last error: {str(subprocess_error)}"
+                                        tool_call.error = subprocess_error_msg
+                                        tool_call.status = "failed"
+                                        
+                                        # We've tried everything - just re-raise
+                                        raise
+                            
+                            self.logger.info(f"SQL QUERY EXECUTION COMPLETE -------------")
+                            self.logger.info(f"Results returned: {len(results) if results else 0} rows")
+                        except Exception as query_error:
+                            self.logger.error(f"Exception during execute_query: {str(query_error)}")
+                            self.logger.error(f"Exception type: {type(query_error)}")
+                            import traceback
+                            self.logger.error(f"Traceback: {traceback.format_exc()}")
+                            # Re-raise to let the outer exception handler deal with it
+                            raise
                         
                         # Format results for response agent
                         formatted_results = []
@@ -244,25 +652,153 @@ class MCPQueryExecutor(ContextProcessor):
                                     formatted_row[key] = value
                             formatted_results.append(formatted_row)
                         
-                        # Store the formatted result
-                        execution_data.results[tool_call.result_id] = formatted_results
-                        
-                        self.logger.info(f"Query returned {len(formatted_results)} rows")
-                        if formatted_results:
-                            self.logger.info(f"First row: {json.dumps(formatted_results[0], indent=2)}")
-                        
-                        # Update the tool call status
-                        tool_call.status = "completed"
-                        tool_call.result = formatted_results
-                    else:
-                        self.logger.error(f"No SQL query provided for tool call {tool_call.name}")
-                        tool_call.status = "failed"
-                        tool_call.error = "No SQL query provided"
-                        
+                        # Check if we have zero results and provide a helpful message
+                        if not formatted_results:
+                            self.logger.info("Query returned zero results, checking for the reason")
+                            
+                            # Check for future dates in parameters
+                            future_date_detected = False
+                            current_date = datetime.now().date()
+                            
+                            if 'start_date' in params:
+                                try:
+                                    start_date_str = params['start_date']
+                                    if isinstance(start_date_str, str):
+                                        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+                                        if start_date > current_date:
+                                            future_date_detected = True
+                                            self.logger.info(f"Future start date detected: {start_date} > {current_date}")
+                                except (ValueError, TypeError) as date_error:
+                                    self.logger.error(f"Error parsing start_date: {date_error}")
+                            
+                            if 'end_date' in params:
+                                try:
+                                    end_date_str = params['end_date']
+                                    if isinstance(end_date_str, str):
+                                        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+                                        if end_date > current_date:
+                                            future_date_detected = True
+                                            self.logger.info(f"Future end date detected: {end_date} > {current_date}")
+                                except (ValueError, TypeError) as date_error:
+                                    self.logger.error(f"Error parsing end_date: {date_error}")
+                            
+                            if future_date_detected:
+                                self.logger.info("This query is for future dates which have no data")
+                                # Still mark as completed but with a note
+                                tool_call.status = "completed"
+                                tool_call.result = []
+                                tool_call.note = "This query is for future dates. No data is available for future time periods."
+                            else:
+                                # Check if we have date range info to provide helpful message
+                                date_range_info = ""
+                                out_of_range = False
+                                available_range_message = ""
+                                
+                                # Get the available date range we fetched earlier
+                                if available_date_range:
+                                    min_date = available_date_range.get('min_date')
+                                    max_date = available_date_range.get('max_date')
+                                    
+                                    if min_date and max_date:
+                                        available_range_message = f" The database currently contains data from {min_date} to {max_date}."
+                                        
+                                        # Check if the query date range is outside available data
+                                        if 'start_date' in params and 'end_date' in params:
+                                            try:
+                                                start_date_str = params['start_date']
+                                                end_date_str = params['end_date']
+                                                
+                                                # Parse dates
+                                                if isinstance(start_date_str, str):
+                                                    start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+                                                else:
+                                                    start_date = start_date_str
+                                                    
+                                                if isinstance(end_date_str, str):
+                                                    end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+                                                else:
+                                                    end_date = end_date_str
+                                                
+                                                # Convert min/max dates if needed
+                                                if isinstance(min_date, str):
+                                                    try:
+                                                        min_date = datetime.strptime(min_date, '%Y-%m-%d').date()
+                                                    except ValueError:
+                                                        # Handle other date formats
+                                                        pass
+                                                        
+                                                if isinstance(max_date, str):
+                                                    try:
+                                                        max_date = datetime.strptime(max_date, '%Y-%m-%d').date()
+                                                    except ValueError:
+                                                        # Handle other date formats
+                                                        pass
+                                                
+                                                # Check if dates are out of range
+                                                if isinstance(end_date, date) and isinstance(min_date, date) and end_date < min_date:
+                                                    out_of_range = True
+                                                    date_range_info = f" for the period {start_date_str} to {end_date_str}, which is before our available data range"
+                                                elif isinstance(start_date, date) and isinstance(max_date, date) and start_date > max_date:
+                                                    out_of_range = True
+                                                    date_range_info = f" for the period {start_date_str} to {end_date_str}, which is after our available data range"
+                                                else:
+                                                    date_range_info = f" for the period {start_date_str} to {end_date_str}"
+                                            except (ValueError, TypeError) as parse_error:
+                                                self.logger.error(f"Error parsing dates for range check: {parse_error}")
+                                                date_range_info = f" for the period {params['start_date']} to {params['end_date']}"
+                                
+                                if not date_range_info and 'start_date' in params and 'end_date' in params:
+                                    date_range_info = f" for the period {params['start_date']} to {params['end_date']}"
+
+                                # Include location info if available
+                                location_info = ""
+                                if 'cfc' in params:
+                                    location_values = params['cfc']
+                                    if isinstance(location_values, list) and location_values:
+                                        location_info = f" in {', '.join(location_values)}"
+                                    elif isinstance(location_values, str):
+                                        location_info = f" in {location_values}"
+
+                                # Store the empty result but with an informative note
+                                self.logger.info(f"Query returned zero results for specified parameters")
+                                
+                                # Update the tool call status
+                                tool_call.status = "completed"
+                                tool_call.result = formatted_results
+                                
+                                if out_of_range:
+                                    tool_call.note = f"No data found{location_info}{date_range_info}.{available_range_message} Please try querying within the available data range."
+                                else:
+                                    tool_call.note = f"No data found{location_info}{date_range_info}. This could be due to no data being available for the specified time period or location, or because the data hasn't been loaded yet.{available_range_message}"
+                        else:
+                            # Store the formatted result
+                            execution_data.results[tool_call.result_id] = formatted_results
+                            
+                            self.logger.info(f"Query returned {len(formatted_results)} rows")
+                            if formatted_results:
+                                self.logger.info(f"First row: {json.dumps(formatted_results[0], indent=2)}")
+                            
+                            # Update the tool call status
+                            tool_call.status = "completed"
+                            tool_call.result = formatted_results
                 except Exception as e:
                     self.logger.error(f"Error executing query for tool call {tool_call.name}: {str(e)}")
                     tool_call.status = "failed"
                     tool_call.error = str(e)
+                    
+                    # Log error details
+                    error_traceback = traceback.format_exc()
+                    self.logger.error(f"Error traceback: {error_traceback}")
+                    
+                    # If it's a BigQuery error, try to get more details
+                    try:
+                        if hasattr(e, 'errors'):
+                            self.logger.error(f"BigQuery errors: {e.errors}")
+                        if hasattr(e, 'error_result'):
+                            self.logger.error(f"Error result: {e.error_result}")
+                    except:
+                        pass
+                    
                     continue
             
             # Set execution end time
@@ -284,6 +820,41 @@ class MCPQueryExecutor(ContextProcessor):
             traceback.print_exc()
             raise
 
+    def _get_data_availability(self):
+        """Get the available date range in the database"""
+        try:
+            # Query to get min and max dates for orders
+            date_range_query = """
+            SELECT 
+                MIN(DATE(delivery_date)) as min_date, 
+                MAX(DATE(delivery_date)) as max_date 
+            FROM `text-to-sql-dev.chatbotdb.orders_drt`
+            """
+            
+            # Execute query
+            self.logger.info("Checking available data range in the database...")
+            try:
+                date_results = self.bigquery_client.execute_query(date_range_query)
+                
+                if date_results and len(date_results) > 0:
+                    min_date = date_results[0].get('min_date')
+                    max_date = date_results[0].get('max_date')
+                    
+                    self.logger.info(f"Available data range: {min_date} to {max_date}")
+                    return {
+                        'min_date': min_date,
+                        'max_date': max_date
+                    }
+                else:
+                    self.logger.warning("No data range information available")
+                    return None
+            except Exception as e:
+                self.logger.error(f"Error getting data availability: {e}")
+                return None
+        except Exception as e:
+            self.logger.error(f"Error in _get_data_availability: {e}")
+            return None
+
 class MCPResponseGenerator(ContextProcessor):
     """MCP processor for generating responses"""
     
@@ -292,35 +863,125 @@ class MCPResponseGenerator(ContextProcessor):
         self.logger = logging.getLogger(__name__)
     
     def process(self, context: Context[QueryExecutionData]) -> Context[ResponseData]:
-        """Generate a response from the query results"""
+        """Generate a response for the user based on the query execution results"""
         try:
             # Extract the execution data
             execution_data = context.data
             
-            # Get the original question from the parent context
-            parent_id = context.metadata.parent_id
-            if not parent_id:
-                raise ValueError("No parent context ID found")
+            # Check if we have tool calls with notes about future dates
+            future_date_notes = []
+            no_data_notes = []
             
-            # Get the original question from the parent context
-            # For now, we'll use a default if we can't get the original
-            question = "What are the results?"  # Default fallback
+            for tool_call in execution_data.tool_calls:
+                if hasattr(tool_call, 'note') and tool_call.note:
+                    if 'future date' in tool_call.note.lower():
+                        future_date_notes.append(tool_call.note)
+                    elif 'no data found' in tool_call.note.lower():
+                        no_data_notes.append(tool_call.note)
             
-            # Get the constraints from the parent context
-            constraints = {}
-            if hasattr(execution_data, 'constraints'):
-                constraints = execution_data.constraints
+            if future_date_notes:
+                # We have a future date query, create a specific response
+                self.logger.info(f"Found future date query notes: {future_date_notes}")
+                
+                # Get cleaner date information for the response
+                date_info = ""
+                for tool_call in execution_data.tool_calls:
+                    if tool_call.sql and '@start_date' in tool_call.sql and '@end_date' in tool_call.sql:
+                        # Find the parameters in the execution data
+                        if hasattr(execution_data, 'constraints') and execution_data.constraints:
+                            constraints = execution_data.constraints
+                            if isinstance(constraints, dict) and 'time_filter' in constraints:
+                                time_filter = constraints['time_filter']
+                                if 'start_date' in time_filter and 'end_date' in time_filter:
+                                    # Format dates for display
+                                    start_date = time_filter['start_date']
+                                    end_date = time_filter['end_date']
+                                    
+                                    # Try to parse and format dates
+                                    try:
+                                        from datetime import datetime
+                                        start = datetime.strptime(start_date, '%Y-%m-%d')
+                                        end = datetime.strptime(end_date, '%Y-%m-%d')
+                                        date_info = f"from {start.strftime('%B %d, %Y')} to {end.strftime('%B %d, %Y')}"
+                                    except (ValueError, TypeError):
+                                        date_info = f"from {start_date} to {end_date}"
+                
+                # Create a user-friendly response
+                if date_info:
+                    summary = f"I don't have any data {date_info} as this time period is in the future. I can only provide data for past time periods. Please try your query with dates in the past."
+                else:
+                    summary = f"I don't have any data for this query because it refers to a future time period. I can only provide data for past time periods. Please try your query with dates in the past."
+                
+                # Create the response data
+                response_data = ResponseData(
+                    query=execution_data.query if hasattr(execution_data, 'query') else "",
+                    summary=summary,
+                    results={},
+                    execution_time=(execution_data.execution_end - execution_data.execution_start).total_seconds() if execution_data.execution_end else 0.0,
+                    created_at=datetime.utcnow(),
+                    status="completed"
+                )
+                
+                return Context(data=response_data)
+            
+            elif no_data_notes:
+                # We have a query that returned no data, but it's not a future date issue
+                self.logger.info(f"Found no data notes: {no_data_notes}")
+                
+                # Extract useful information from the note
+                note = no_data_notes[0]
+                
+                # Create a user-friendly response
+                summary = f"I couldn't find any data for your query. {note}"
+                
+                # Create the response data
+                response_data = ResponseData(
+                    query=execution_data.query if hasattr(execution_data, 'query') else "",
+                    summary=summary,
+                    results={},
+                    execution_time=(execution_data.execution_end - execution_data.execution_start).total_seconds() if execution_data.execution_end else 0.0,
+                    created_at=datetime.utcnow(),
+                    status="completed"
+                )
+                
+                return Context(data=response_data)
+            
+            # Check if we have a failed query
+            has_failed_tool_calls = any(tool_call.status == "failed" for tool_call in execution_data.tool_calls)
+            
+            if has_failed_tool_calls or not execution_data.results:
+                # We have a failed query
+                self.logger.info("Generating response for failed query")
+                
+                # Extract error messages from failed tool calls
+                error_messages = []
+                for tool_call in execution_data.tool_calls:
+                    if tool_call.status == "failed" and tool_call.error:
+                        error_messages.append(tool_call.error)
+                
+                error_summary = "; ".join(error_messages) if error_messages else "Unknown error"
+                
+                # Create a response data object with the error information
+                response_data = ResponseData(
+                    query=execution_data.query if hasattr(execution_data, 'query') else "",
+                    summary="I apologize, but I couldn't retrieve any data for your query. Please try again or rephrase your question.",
+                    error=error_summary,
+                    results={},
+                    execution_time=(execution_data.execution_end - execution_data.execution_start).total_seconds() if execution_data.execution_end else 0.0,
+                    created_at=datetime.utcnow(),
+                    status="failed"
+                )
+                
+                # Return a context with the response data
+                return Context(data=response_data)
             
             # Generate the response
             self.logger.info("\nGenerating response...")
-            self.logger.info(f"Question: {question}")
             self.logger.info(f"Results: {json.dumps(execution_data.results, indent=2)}")
-            self.logger.info(f"Constraints: {json.dumps(constraints, indent=2)}")
             
             response_text = self.response_agent.generate_response(
-                question=question,
-                results=execution_data.results,
-                constraints=constraints
+                question=execution_data.query,
+                results=execution_data.results
             )
             
             if not response_text:
@@ -333,7 +994,7 @@ class MCPResponseGenerator(ContextProcessor):
             
             # Create response data
             response_data = ResponseData(
-                query=question,
+                query=execution_data.query,
                 summary=response_text,
                 results=execution_data.results,
                 execution_time=execution_time,
@@ -721,20 +1382,6 @@ class MCPQueryFlowOrchestrator:
                     )
                 )
             
-            # Step 7: Update session with what we have
-            try:
-                self._update_session(
-                    query_context=query_context,
-                    classification_context=classification_context,
-                    constraint_context=constraint_context,
-                    strategy_context=strategy_context,
-                    execution_context=execution_context,
-                    response_context=response_context
-                )
-            except Exception as e:
-                print(f"⚠️ Warning: Error updating session: {str(e)}")
-                # Continue processing anyway - already have a response
-            
             return response_context
             
         except Exception as e:
@@ -770,60 +1417,4 @@ class MCPQueryFlowOrchestrator:
                 status="error",
                 error_message=error_message
             )
-        )
-        
-    def _update_session(self, query_context, classification_context=None, constraint_context=None,
-                        strategy_context=None, execution_context=None, response_context=None):
-        """Update the session with available context data"""
-        try:
-            # Get session ID
-            session_id = query_context.metadata.session_id
-            if not session_id:
-                print("⚠️ No session ID available for update")
-                return
-                
-            # Try to get the session first
-            try:
-                session = self.session_manager.session_manager.get_session(session_id)
-            except Exception as e:
-                print(f"⚠️ Session not found, creating new one: {str(e)}")
-                # Create new session
-                self.session_manager.session_manager.create_session(
-                    query_context.data.user_id if hasattr(query_context.data, 'user_id') else "anonymous",
-                    query_context.data.question,
-                    session_id
-                )
-                session = self.session_manager.session_manager.get_session(session_id)
-                
-            if not session:
-                print(f"⚠️ Could not create or retrieve session {session_id}")
-                return
-                
-            # Update session with available data
-            updates = {
-                "status": "processing"
-            }
-            
-            # Add classification data if available
-            if classification_context:
-                updates["question_type"] = classification_context.data.question_type
-                updates["classification"] = {
-                    "question": classification_context.data.question,
-                    "question_type": classification_context.data.question_type,
-                    "confidence": classification_context.data.confidence,
-                    "requires_sql": classification_context.data.requires_sql,
-                    "requires_summary": classification_context.data.requires_summary
-                }
-            
-            # Add response data if available
-            if response_context:
-                updates["status"] = "completed"
-                updates["summary"] = response_context.data.summary
-                
-            # Update session
-            self.session_manager.session_manager.update_session(session_id, updates)
-            print(f"✅ Updated session {session_id}")
-            
-        except Exception as e:
-            print(f"⚠️ Error updating session: {str(e)}")
-            traceback.print_exc() 
+        ) 

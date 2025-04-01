@@ -1,4 +1,4 @@
-﻿"""
+"""
 Response Agent for generating natural language responses from query results.
 
 This module provides a ResponseAgent class that takes query results and generates
@@ -126,6 +126,9 @@ class ResponseAgent:
                     else:
                         response_text = truncated + "..."
                 
+                # Format numbers with commas
+                response_text = self._format_numbers_with_commas(response_text)
+                
                 self.logger.info(f"Successfully generated response: {response_text}")
                 return response_text
                 
@@ -189,116 +192,92 @@ class ResponseAgent:
         """
         self.logger.info("\nCreating response prompt...")
         
-        # Format the data for the prompt
-        # Handle multiple results for comparisons
-        all_summaries = []
-        all_data_points = []
-        comparison_entities = []
-
-        for result_id, result_set in results.items():
-            if isinstance(result_set, dict) and result_set.get("status") == "success":
-                data_container = result_set.get("data", {})
-                summary = data_container.get("summary", {})
-                data_points = data_container.get("data", [])
-                
-                # Try to infer the entity being described (e.g., location, time period)
-                entity_name = summary.get("location") or summary.get("time_period") or result_id
-                comparison_entities.append(entity_name)
-                
-                # Format summary for this entity
-                entity_summary = self._format_single_summary(summary, data_points, entity_name)
-                all_summaries.append(entity_summary)
-                all_data_points.extend(data_points)
-            else:
-                self.logger.warning(f"Skipping unsuccessful or invalid result set: {result_id}")
-
-        if not all_summaries:
-            self.logger.error("No successful data found in results.")
+        # Extract result data
+        result_data = None
+        for result_id, data in results.items():
+            if isinstance(data, dict) and data.get("status") == "success":
+                result_data = data.get("data", {})
+                break
+        
+        if not result_data or not result_data.get("data"):
             return f"""You are a helpful analytics assistant.
             The user asked: "{question}"
-            Unfortunately, no data was found or the data retrieved was invalid. Please apologize and suggest they try different parameters or rephrase their question.
+            Unfortunately, no data was found. Please apologize and suggest they try different parameters or rephrase their question.
             
             IMPORTANT: Keep your response under 2900 characters and format numbers with commas."""
         
-        # Combine formatted summaries
-        formatted_summaries = "\n\n".join(all_summaries)
-
-        # Get overall time period if consistent across summaries
-        # (Assuming constraints provide the intended overall period)
-        overall_time_period = constraints.get("time_filter", {}).get("start_date", "unknown") + " to " + constraints.get("time_filter", {}).get("end_date", "unknown")
-
-        # Generate prompt for Gemini
-        prompt = f"""You are a helpful analytics assistant. Generate a concise response to the user's question based on the provided data summaries.
-
-Question: "{question}"
-
-Data Summaries:
-{formatted_summaries}
-
-Overall Time Period for Analysis: {overall_time_period}
-
-Instructions:
-1. Address the user's question directly. If it's a comparison, explicitly compare the entities ({', '.join(comparison_entities)}).
-2. Synthesize insights from ALL provided data summaries.
-3. Mention the overall time period for the analysis.
-4. Include key statistics (totals, averages, highs, lows) for each entity being discussed.
-5. Format large numbers with commas (e.g., 1,234,567).
-6. Keep the response under 2900 characters.
-7. Use clear paragraph breaks for readability.
-8. Maintain a natural, conversational, and informative tone.
-9. If comparing, clearly state the differences or similarities found.
-
-Example Comparison Snippet:
-"Comparing {comparison_entities[0]} and {comparison_entities[1]} for the period {overall_time_period}:\n- Total Orders: {comparison_entities[0]} had X orders, while {comparison_entities[1]} had Y orders.\n- Average Daily Orders: {comparison_entities[0]} averaged A orders/day, compared to B orders/day for {comparison_entities[1]}.\n- Peak Day: {comparison_entities[0]}'s busiest day saw P orders, whereas {comparison_entities[1]}'s peak was Q orders."
-
-Generate the final response based on these instructions and the data provided.
-"""
-
-        self.logger.info(f"Generated response prompt for comparison: \n{prompt[:500]}...")
-        return prompt
-
-    def _format_single_summary(self, summary: Dict[str, Any], data_points: List[Dict[str, Any]], entity_name: str) -> str:
-        """Helper function to format the summary section for a single entity."""
+        # Format the data for the prompt
+        summary = result_data.get("summary", {})
+        data_points = result_data.get("data", [])
+        
+        # Calculate some basic statistics if we have numeric data
+        stats = {}
+        if data_points:
+            for key in data_points[0].keys():
+                if all(isinstance(point.get(key), (int, float)) for point in data_points):
+                    values = [point[key] for point in data_points]
+                    stats[key] = {
+                        "total": sum(values),
+                        "average": sum(values) / len(values),
+                        "max": max(values),
+                        "min": min(values)
+                    }
+        
+        # Create summary points
         summary_points = []
-        summary_points.append(f"**Summary for {entity_name}:**")
-        summary_points.append(f"- Time Period Covered by Data: {summary.get('time_period', 'Not specified')}")
-        summary_points.append(f"- Location/Entity: {summary.get('location', entity_name)}") # Use entity_name as fallback
-        summary_points.append(f"- Total Records Analyzed: {summary.get('total_records', len(data_points))}")
-
+        summary_points.append(f"- Time Period: {summary.get('time_period', 'Not specified')}")
+        summary_points.append(f"- Location: {summary.get('location', 'Not specified')}")
+        summary_points.append(f"- Total Records: {summary.get('total_records', len(data_points))}")
+        
         # Add order statistics if available
         order_stats = summary.get('total_orders', {})
         if order_stats:
             summary_points.append("- Order Statistics:")
-            # Ensure values exist and format them
-            total = order_stats.get('total', 0)
-            avg = order_stats.get('average', 0)
-            max_val = order_stats.get('max', 0)
-            min_val = order_stats.get('min', 0)
-            summary_points.append(f"  - Total Orders: {total:,.0f}")
-            summary_points.append(f"  - Average Orders per Day: {avg:,.2f}")
-            summary_points.append(f"  - Maximum Orders in a Day: {max_val:,.0f}")
-            summary_points.append(f"  - Minimum Orders in a Day: {min_val:,.0f}")
-        else:
-             # Attempt to calculate from raw data if summary is missing stats
-             if data_points and 'total_orders' in data_points[0]:
-                 try:
-                     order_values = [point['total_orders'] for point in data_points]
-                     total = sum(order_values)
-                     avg = total / len(order_values) if order_values else 0
-                     max_val = max(order_values) if order_values else 0
-                     min_val = min(order_values) if order_values else 0
-                     summary_points.append("- Order Statistics (Calculated):")
-                     summary_points.append(f"  - Total Orders: {total:,.0f}")
-                     summary_points.append(f"  - Average Orders per Day: {avg:,.2f}")
-                     summary_points.append(f"  - Maximum Orders in a Day: {max_val:,.0f}")
-                     summary_points.append(f"  - Minimum Orders in a Day: {min_val:,.0f}")
-                 except KeyError:
-                     summary_points.append("- Order statistics could not be calculated from data points.")
-             else:
-                 summary_points.append("- No detailed order statistics available.")
+            summary_points.append(f"  - Total Orders: {order_stats.get('total', 0):,.0f}")
+            summary_points.append(f"  - Average Orders per Day: {order_stats.get('average', 0):,.2f}")
+            summary_points.append(f"  - Maximum Orders in a Day: {order_stats.get('max', 0):,.0f}")
+            summary_points.append(f"  - Minimum Orders in a Day: {order_stats.get('min', 0):,.0f}")
+        
+        # Get sample data points
+        sample_points = []
+        for point in data_points[:5]:
+            formatted_point = []
+            for k, v in point.items():
+                if isinstance(v, (datetime.date, datetime.datetime)):
+                    formatted_point.append(f"{k}: {v.strftime('%Y-%m-%d')}")
+                elif isinstance(v, (int, float)):
+                    formatted_point.append(f"{k}: {v:,.0f}")
+                else:
+                    formatted_point.append(f"{k}: {v}")
+            sample_points.append("- " + ", ".join(formatted_point))
+        
+        prompt = f"""You are a helpful analytics assistant. Generate a concise response to the user's question.
 
-        return "\n".join(summary_points)
+Question: "{question}"
 
+Data Summary:
+{chr(10).join(summary_points)}
+
+{f'''Sample Data Points:
+{chr(10).join(sample_points)}''' if sample_points else ''}
+
+Instructions:
+1. Start with a direct answer addressing the user's question
+2. Include key statistics and insights from the data
+3. Mention the time period and location being analyzed
+4. Format large numbers with commas for readability
+5. Keep the response under 2900 characters to ensure it fits in a single message
+6. Focus on the most relevant information for the user's question
+7. Use clear paragraph breaks for readability
+8. Avoid using special characters or emojis that might cause formatting issues
+
+Example format:
+"For {location} during {time_period}, there were {total_orders:,} total orders, averaging {average_orders:,.0f} orders per day. The highest daily volume was {max_orders:,} orders, while the lowest was {min_orders:,} orders."
+
+Remember to be helpful and informative while maintaining a natural conversational tone."""
+        
+        return prompt
+        
     def generate_error_response(self, question: str, error: str) -> str:
         """
         Generate an error response when query execution fails.

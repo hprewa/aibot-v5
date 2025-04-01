@@ -7,94 +7,68 @@ from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta, MO, SU
 import os
 import traceback
+from google.cloud import bigquery
+import dspy
+from dspy_tables import OrdersTable, OrdersQueryBuilder, ATPTable, ATPQueryBuilder, KPIQueryBuilder
 
 class QueryProcessor:
     def __init__(self, gemini_client: GeminiClient, bigquery_client: BigQueryClient):
         self.gemini_client = gemini_client
         self.bigquery_client = bigquery_client
         self._initialize_sql_templates()
+        self.kpi_query_builders = {
+            'orders': OrdersQueryBuilder(),
+            'atp': ATPQueryBuilder(),
+            # Add more KPI query builders as needed
+        }
         
     def _initialize_sql_templates(self):
         """Initialize SQL query templates"""
         self.sql_templates = {
-            "simple_count": """
+            "simple_metric": """
                 WITH location_data AS (
                     SELECT 
-                        o.*,
-                        COALESCE(m.cfc, o.location) as cfc,
+                        d.*,
+                        COALESCE(m.cfc, d.location) as cfc,
                         m.spoke
-                    FROM `{project}.{dataset}.orders_drt` o
+                    FROM `{project}.{dataset}.{table}` d
                     LEFT JOIN `{project}.{dataset}.cfc_spoke_mapping` m
-                    ON o.location = m.spoke
-                    WHERE order_date BETWEEN @start_date AND @end_date
+                    ON d.location = m.spoke
+                    WHERE {date_col} BETWEEN @start_date AND @end_date
                 )
                 SELECT 
-                    COUNT(*) as order_count
-                FROM location_data
-                WHERE {location_filter}
-            """,
-            "location_comparison": """
-                WITH location_data AS (
-                    SELECT 
-                        o.*,
-                        COALESCE(m.cfc, o.location) as cfc,
-                        m.spoke
-                    FROM `{project}.{dataset}.orders_drt` o
-                    LEFT JOIN `{project}.{dataset}.cfc_spoke_mapping` m
-                    ON o.location = m.spoke
-                    WHERE order_date BETWEEN @start_date AND @end_date
-                )
-                SELECT 
+                    {date_col},
                     {group_by_cols},
-                    COUNT(*) as order_count
+                    {metric_cols}
                 FROM location_data
                 WHERE {location_filter}
-                GROUP BY {group_by_cols}
-                ORDER BY order_count DESC
-            """,
-            "daily_trend": """
-                WITH location_data AS (
-                    SELECT 
-                        o.*,
-                        COALESCE(m.cfc, o.location) as cfc,
-                        m.spoke
-                    FROM `{project}.{dataset}.orders_drt` o
-                    LEFT JOIN `{project}.{dataset}.cfc_spoke_mapping` m
-                    ON o.location = m.spoke
-                    WHERE order_date BETWEEN @start_date AND @end_date
-                )
-                SELECT 
-                    DATE(order_date) as date,
-                    {group_by_cols},
-                    COUNT(*) as order_count
-                FROM location_data
-                WHERE {location_filter}
-                GROUP BY date, {group_by_cols}
-                ORDER BY date
+                GROUP BY {date_col}, {group_by_cols}
+                ORDER BY {date_col}
             """
         }
         
     def extract_constraints(self, question: str) -> Dict[str, Any]:
         """Extract constraints using Gemini Flash thinking 2.0"""
-        # Get current date and calculate time ranges
-        current_date = datetime.now()
-        last_week_start = (current_date - timedelta(days=7)).strftime('%Y-%m-%d')
-        last_week_end = current_date.strftime('%Y-%m-%d')
-        past_month_start = (current_date - timedelta(days=30)).strftime('%Y-%m-%d')
-        past_month_end = current_date.strftime('%Y-%m-%d')
-        
-        # Get CFC-Spoke mapping
-        cfc_spoke_mapping = self.bigquery_client.get_cfc_spoke_mapping()
-        cfc_list = list(cfc_spoke_mapping.keys())
-        spoke_list = []
-        for spokes in cfc_spoke_mapping.values():
-            spoke_list.extend(spokes)
-        spoke_list = list(set(spoke_list))  # Remove duplicates
-        
-        # Get schema context
-        schema_context = self._get_schema_context()
-        
-        prompt = f"""You are a Flash Thinking 2.0 constraint extractor for a SQL query generator.
+        try:
+            # Get current date and calculate time ranges
+            current_date = datetime.now()
+            last_week_start = (current_date - timedelta(days=7)).strftime('%Y-%m-%d')
+            last_week_end = current_date.strftime('%Y-%m-%d')
+            past_month_start = (current_date - timedelta(days=30)).strftime('%Y-%m-%d')
+            past_month_end = current_date.strftime('%Y-%m-%d')
+            
+            # Get CFC-Spoke mapping
+            cfc_spoke_mapping = self.bigquery_client.get_cfc_spoke_mapping()
+            cfc_list = list(cfc_spoke_mapping.keys())
+            spoke_list = []
+            for spokes in cfc_spoke_mapping.values():
+                spoke_list.extend(spokes)
+            spoke_list = list(set(spoke_list))  # Remove duplicates
+            
+            # Get schema context
+            schema_context = self._get_schema_context()
+            
+            prompt = f"""You are a Flash Thinking 2.0 constraint extractor for a SQL query generator.
 Given this question: "{question}"
 
 Available tables and their schemas:
@@ -188,93 +162,131 @@ IMPORTANT:
    - Each query should have a descriptive name and purpose
    - Include all tables that will be needed for each query
    - Assign a unique result_id to each tool call
+   - **IMPORTANT FOR COMPARISONS:** If `comparison_type` is "between_locations" or "time_periods", create a *separate tool call for each location or time period being compared*. Each tool call should fetch data for only *one* specific entity (e.g., one CFC, one time range). The `result_id` should clearly indicate which entity it belongs to (e.g., `orders_london_2024`, `orders_stevenage_2024`).
 8. For response_plan:
    - Create a clear plan for how the Response agent should handle results
    - Link each tool call result to specific insights
+   - If multiple tool calls were generated for a comparison, ensure the plan details how to combine/compare their `result_id`s.
    - Provide a structured outline for the final response
 """
-        
-        try:
-            response = self.gemini_client.generate_content(prompt)
-            if not response:
-                raise Exception("No response from Gemini")
+            
+            # --- Try calling Gemini and parsing --- 
+            try:
+                print(f"Extract Constraints: Using GeminiClient ID = {id(self.gemini_client)}") # LOGGING
+                response = self.gemini_client.generate_content(prompt)
+                if not response:
+                    raise Exception("No response from Gemini")
+                    
+                # Clean the response to ensure it's valid JSON
+                cleaned_response = response.strip()
+                if cleaned_response.startswith("```json"):
+                    cleaned_response = cleaned_response[7:]
+                if cleaned_response.endswith("```"):
+                    cleaned_response = cleaned_response[:-3]
+                cleaned_response = cleaned_response.strip()
                 
-            # Clean the response to ensure it's valid JSON
-            cleaned_response = response.strip()
-            if cleaned_response.startswith("```json"):
-                cleaned_response = cleaned_response[7:]
-            if cleaned_response.endswith("```"):
-                cleaned_response = cleaned_response[:-3]
-            cleaned_response = cleaned_response.strip()
+                # Parse the JSON
+                constraints = json.loads(cleaned_response)
+                
+            except json.JSONDecodeError as json_e:
+                print(f"!!! Invalid JSON response from Gemini during constraint extraction: {response}")
+                print(f"JSON Decode Error: {str(json_e)}")
+                # Raise the exception to be caught by the outer block
+                raise Exception(f"Invalid constraint format from Gemini: {str(json_e)}") 
+            except Exception as gemini_e:
+                print(f"!!! Error during Gemini call or response cleaning: {str(gemini_e)}")
+                raise # Re-raise to be caught by outer block
+            # --------------------------------------
             
-            # Parse the JSON
-            constraints = json.loads(cleaned_response)
-            
-            # Validate required fields
-            required_fields = ["kpi", "time_aggregation", "time_filter", "cfc", "spokes", "tool_calls", "response_plan"]
-            for field in required_fields:
-                if field not in constraints:
-                    if field == "time_aggregation":
-                        constraints[field] = "Daily"  # Default time aggregation
-                    elif field == "time_filter":
-                        constraints[field] = {
-                            "start_date": (current_date - timedelta(days=7)).strftime('%Y-%m-%d'),
-                            "end_date": current_date.strftime('%Y-%m-%d')
-                        }
-                    elif field in ["cfc", "spokes"]:
-                        constraints[field] = []
-                    elif field == "tool_calls":
-                        constraints[field] = []
-                    elif field == "response_plan":
-                        constraints[field] = {
-                            "data_connections": [],
-                            "insights": [],
-                            "response_structure": {
-                                "introduction": "Provide an overview of the analysis",
-                                "main_points": ["Present the key findings"],
-                                "context": "Add relevant context",
-                                "conclusion": "Summarize the analysis"
+            # --- Try validating and processing constraints ---    
+            try:
+                # Validate required fields and apply defaults
+                required_fields = ["kpi", "time_aggregation", "time_filter", "cfc", "spokes", "tool_calls", "response_plan"]
+                current_date = datetime.now() # Re-define for default date logic
+                for field in required_fields:
+                    if field not in constraints:
+                        print(f"Warning: Field '{field}' missing from constraints, applying default.")
+                        if field == "time_aggregation":
+                            constraints[field] = "Daily"  # Default time aggregation
+                        elif field == "time_filter":
+                            constraints[field] = {
+                                "start_date": (current_date - timedelta(days=7)).strftime('%Y-%m-%d'),
+                                "end_date": current_date.strftime('%Y-%m-%d')
                             }
-                        }
+                        elif field in ["cfc", "spokes", "kpi", "tool_calls"]:
+                            constraints[field] = []
+                        elif field == "response_plan":
+                            constraints[field] = {
+                                "data_connections": [],
+                                "insights": [],
+                                "response_structure": {
+                                    "introduction": "Provide an overview of the analysis",
+                                    "main_points": ["Present the key findings"],
+                                    "context": "Add relevant context",
+                                    "conclusion": "Summarize the analysis"
+                                }
+                            }
+                        else:
+                             constraints[field] = None # Or some other appropriate default
+                
+                # Validate CFCs and spokes against the mapping
+                if constraints.get("cfc"):
+                    valid_cfcs = [cfc for cfc in constraints["cfc"] if cfc in cfc_list]
+                    if valid_cfcs != constraints["cfc"]:
+                        print(f"Warning: Some CFCs were not found in the mapping: {set(constraints['cfc']) - set(valid_cfcs)}")
+                    constraints["cfc"] = valid_cfcs
+                
+                if constraints.get("spokes"):
+                    if constraints["spokes"] == "all":
+                        constraints["spokes"] = spoke_list
+                    elif isinstance(constraints["spokes"], list):
+                        valid_spokes = [spoke for spoke in constraints["spokes"] if spoke in spoke_list]
+                        if valid_spokes != constraints["spokes"]:
+                            print(f"Warning: Some spokes were not found in the mapping: {set(constraints['spokes']) - set(valid_spokes)}")
+                        constraints["spokes"] = valid_spokes
                     else:
-                        constraints[field] = []
+                        print(f"Warning: 'spokes' field has unexpected type: {type(constraints['spokes'])}, setting to empty list.")
+                        constraints["spokes"] = [] # Reset if not a list or 'all'
+                
+                print("Constraint validation successful.")
+                return constraints
+
+            except Exception as validation_e:
+                print(f"!!! Error during constraint validation/processing: {str(validation_e)}")
+                # Re-raise to be caught by the outer block
+                raise 
+            # ----------------------------------------------
             
-            # Validate CFCs and spokes against the mapping
-            if constraints["cfc"]:
-                valid_cfcs = [cfc for cfc in constraints["cfc"] if cfc in cfc_list]
-                if valid_cfcs != constraints["cfc"]:
-                    print(f"Warning: Some CFCs were not found in the mapping: {set(constraints['cfc']) - set(valid_cfcs)}")
-                constraints["cfc"] = valid_cfcs
-            
-            if constraints["spokes"]:
-                if constraints["spokes"] == "all":
-                    constraints["spokes"] = spoke_list
-                else:
-                    valid_spokes = [spoke for spoke in constraints["spokes"] if spoke in spoke_list]
-                    if valid_spokes != constraints["spokes"]:
-                        print(f"Warning: Some spokes were not found in the mapping: {set(constraints['spokes']) - set(valid_spokes)}")
-                    constraints["spokes"] = valid_spokes
-            
-            return constraints
-            
-        except json.JSONDecodeError as e:
-            print(f"Invalid JSON response from Gemini: {response}")
-            raise Exception("Invalid constraint format returned")
-        except Exception as e:
-            print(f"Error extracting constraints: {str(e)}")
-            raise
-            
+        except Exception as outer_e:
+            print(f"!!! FAILED to extract constraints for question: '{question}'")
+            print(f"Error: {str(outer_e)}")
+            traceback.print_exc() # Log the full traceback here
+            # Return a default empty/error structure instead of crashing
+            return {
+                "kpi": [],
+                "time_aggregation": "Daily",
+                "time_filter": {"start_date": "", "end_date": ""},
+                "cfc": [],
+                "spokes": [],
+                "comparison_type": None,
+                "tool_calls": [],
+                "response_plan": {},
+                "error": f"Failed to extract constraints: {str(outer_e)}"
+            }
+        
     def _get_schema_context(self) -> str:
-        """Get formatted schema information for all relevant tables"""
-        schema_info = []
+        """Get schema context for all relevant tables"""
+        schema_context = []
         
-        for table_name in ["orders", "slot_availability", "cfc_spoke_mapping"]:
-            schema = self.bigquery_client.schema_cache.get(table_name)
+        # Add schema for each table
+        for table_name in self.bigquery_client.tables:
+            schema = self.bigquery_client.get_schema(table_name)  # Use get_schema method instead
             if schema:
-                columns = [f"- {field.name} ({field.field_type})" for field in schema]
-                schema_info.append(f"{table_name} table:\n" + "\n".join(columns))
-        
-        return "\n\n".join(schema_info)
+                schema_context.append(f"Table {table_name}:")
+                schema_context.append("Columns: " + ", ".join(schema))
+                schema_context.append("")  # Empty line for readability
+                
+        return "\n".join(schema_context)
         
     def generate_strategy(self, question: str, constraints: Dict[str, Any]) -> str:
         """Generate a strategy using Gemini Flash thinking 2.0"""
@@ -333,13 +345,17 @@ The Response Agent will use this structure to generate a comprehensive and well-
         
     def generate_sql(self, question: str, constraints: Dict[str, Any]) -> List[str]:
         """Generate SQL queries based on the question and constraints"""
-        # First check if we can use a template
-        template_name = self._get_template_name(constraints)
-        if template_name:
-            return [self._fill_sql_template(self.sql_templates[template_name], constraints)]
-            
-        # If no template fits, generate new SQL using Gemini
+        # Get schema context for the prompt
         schema_context = self._get_schema_context()
+        
+        # Extract KPIs and tables needed
+        kpis = constraints.get("kpi", [])
+        tables = set()
+        for kpi in kpis:
+            # Get table for each KPI
+            table = self._get_table_for_kpi(kpi)
+            if table:
+                tables.add(table)
         
         prompt = f"""You are a Flash Thinking 2.0 SQL generator.
 Generate a BigQuery SQL query to answer this question: "{question}"
@@ -347,6 +363,9 @@ Using these constraints: {json.dumps(constraints)}
 
 Available tables and their schemas:
 {schema_context}
+
+KPIs requested: {', '.join(kpis)}
+Tables needed: {', '.join(tables)}
 
 The query should:
 1. Use proper BigQuery syntax
@@ -356,6 +375,9 @@ The query should:
 5. Include ORDER BY for any time series or rankings
 6. Use appropriate parameter placeholders (@param_name)
 7. Be optimized for performance
+8. Handle multiple KPIs if needed
+9. Use appropriate joins between fact and dimension tables
+10. Include proper column aliases for clarity
 
 Return ONLY the SQL query, no explanation.
 """
@@ -366,50 +388,103 @@ Return ONLY the SQL query, no explanation.
             
         return [response]
         
-    def _get_template_name(self, constraints: Dict[str, Any]) -> Optional[str]:
-        """Determine which SQL template to use based on constraints"""
-        if not constraints.get("comparison_type"):
-            return "simple_count"
-        elif constraints["comparison_type"] == "between_locations":
-            return "location_comparison"
-        elif constraints["comparison_type"] == "trend":
-            return "daily_trend"
-        return None
+    def _get_table_for_kpi(self, kpi: str) -> Optional[str]:
+        """Get the appropriate table name for a given KPI"""
+        # This mapping should be moved to a configuration file or database
+        kpi_to_table = {
+            "orders": "orders_drt",
+            "atp": "slot_availability_drt",
+            # Add more KPI to table mappings as needed
+        }
+        return kpi_to_table.get(kpi)
         
     def _fill_sql_template(self, template: str, constraints: Dict[str, Any]) -> str:
         """Fill in SQL template with specific constraints"""
-        # Get project and dataset from environment
-        project = os.getenv('PROJECT_ID')
-        dataset = os.getenv('DATASET_ID')
+        # Get project and dataset
+        project = self.project_id
+        dataset = self.dataset_id
         
-        # Build location filter based on type
-        location_type = constraints.get('location_type', 'CFC')
-        locations = constraints.get('locations', [])
+        # Get KPI details
+        kpi = constraints.get("kpi", [])[0] if constraints.get("kpi") else None
+        if not kpi:
+            raise ValueError("No KPI specified in constraints")
         
-        if location_type == 'Network':
-            location_filter = "1=1"  # No filtering needed
-        elif location_type == 'CFC':
-            location_filter = "cfc IN UNNEST(@locations)" if locations else "1=1"
-        else:  # Spoke
-            location_filter = "spoke IN UNNEST(@locations)" if locations else "1=1"
-            
+        table = self._get_table_for_kpi(kpi)
+        if not table:
+            raise ValueError(f"No table found for KPI: {kpi}")
+        
+        # Build location filter
+        location_filter = self._build_location_filter(constraints)
+        
+        # Get date column and metric columns
+        date_col = self._get_date_column(table)
+        metric_cols = self._get_metric_columns(table, kpi)
+        
         # Determine group by columns
-        group_by_cols = ", ".join(constraints.get('group_by_cols', []))
-        if not group_by_cols:
-            if location_type == 'CFC':
-                group_by_cols = "cfc"
-            elif location_type == 'Spoke':
-                group_by_cols = "spoke, cfc"
-                
+        group_by_cols = self._get_group_by_columns(constraints)
+        
         # Fill in the template
         query = template.format(
             project=project,
             dataset=dataset,
+            table=table,
+            date_col=date_col,
             location_filter=location_filter,
-            group_by_cols=group_by_cols
+            group_by_cols=group_by_cols,
+            metric_cols=metric_cols
         )
         
         return query.strip()
+        
+    def _build_location_filter(self, constraints: Dict[str, Any]) -> str:
+        """Build the location filter clause based on constraints"""
+        cfcs = constraints.get("cfc", [])
+        spokes = constraints.get("spokes", [])
+        
+        filters = []
+        if cfcs:
+            filters.append(f"cfc IN UNNEST(@cfcs)")
+        if spokes and spokes != "all":
+            filters.append(f"spoke IN UNNEST(@spokes)")
+        
+        return " AND ".join(filters) if filters else "1=1"
+        
+    def _get_date_column(self, table: str) -> str:
+        """Get the date column name for a table"""
+        # This mapping should be moved to a configuration file or database
+        date_columns = {
+            "orders_drt": "delivery_date",
+            "slot_availability_drt": "slot_date",
+            # Add more table to date column mappings as needed
+        }
+        return date_columns.get(table, "date")
+        
+    def _get_metric_columns(self, table: str, kpi: str) -> str:
+        """Get the metric columns to select for a KPI"""
+        # This mapping should be moved to a configuration file or database
+        metric_columns = {
+            "orders": "SUM(orders) as total_orders",
+            "atp": "AVG(atp_score) as avg_atp, COUNT(*) as total_slots",
+            # Add more KPI to metric column mappings as needed
+        }
+        return metric_columns.get(kpi, f"COUNT(*) as total_{kpi}")
+        
+    def _get_group_by_columns(self, constraints: Dict[str, Any]) -> str:
+        """Get the group by columns based on constraints"""
+        group_by = []
+        
+        # Add location-based grouping
+        if constraints.get("cfc"):
+            group_by.append("cfc")
+        if constraints.get("spokes") and constraints["spokes"] != "all":
+            group_by.append("spoke")
+        
+        # Add time-based grouping if specified
+        time_agg = constraints.get("time_aggregation", "Daily")
+        if time_agg != "Daily":
+            group_by.append(f"DATE_TRUNC({time_agg})")
+        
+        return ", ".join(group_by) if group_by else "1"
         
     def generate_summary(self, question: str, results: Dict[str, list], constraints: Dict[str, Any]) -> str:
         """Generate summary using structured response plan"""
@@ -555,4 +630,244 @@ Return ONLY the SQL query, no explanation.
             
         except Exception as e:
             print(f"CRITICAL ERROR updating session {session_id}: {str(e)}")
-            traceback.print_exc() 
+            traceback.print_exc()
+
+    def process_kpi_query(self, kpi: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Process a KPI query using DSPy query builders
+        """
+        try:
+            print(f"\nProcessing {kpi} query with parameters:", json.dumps(params, indent=2))
+            
+            # Get the appropriate query builder
+            query_builder = self.kpi_query_builders.get(kpi)
+            if not query_builder:
+                error_msg = f"Unsupported KPI type: {kpi}"
+                print(f"ERROR: {error_msg}")
+                return {
+                    "status": "error",
+                    "message": error_msg,
+                    "data": None
+                }
+            
+            # Prepare query parameters
+            query_params = {}
+            
+            # Handle date parameters
+            if 'time_filter' in params:
+                time_filter = params['time_filter']
+                # Convert string dates to datetime.date objects
+                if isinstance(time_filter.get('start_date'), str):
+                    query_params['start_date'] = datetime.strptime(time_filter['start_date'], '%Y-%m-%d').date()
+                else:
+                    query_params['start_date'] = time_filter.get('start_date')
+                    
+                if isinstance(time_filter.get('end_date'), str):
+                    query_params['end_date'] = datetime.strptime(time_filter['end_date'], '%Y-%m-%d').date()
+                else:
+                    query_params['end_date'] = time_filter.get('end_date')
+            
+            # Handle location parameters
+            if 'cfc' in params and params['cfc']:
+                if isinstance(params['cfc'], list):
+                    # Ensure all values are strings
+                    query_params['cfc'] = [str(cfc).lower() for cfc in params['cfc']]
+                else:
+                    query_params['cfc'] = str(params['cfc']).lower()
+                    
+            if 'spokes' in params and params['spokes']:
+                if params['spokes'] == 'all':
+                    query_params['spoke'] = 'all'
+                elif isinstance(params['spokes'], list):
+                    # Ensure all values are strings
+                    query_params['spoke'] = [str(spoke).lower() for spoke in params['spokes']]
+                else:
+                    query_params['spoke'] = str(params['spokes']).lower()
+            
+            # Handle aggregation
+            if 'time_aggregation' in params:
+                query_params['aggregation'] = str(params['time_aggregation']).lower()
+            
+            print(f"Prepared query parameters:", json.dumps(query_params, default=str, indent=2))
+            
+            # Get date column based on aggregation
+            date_col = query_builder._get_date_column(query_params.get('aggregation', 'daily'))
+            print(f"Using date column: {date_col}")
+            
+            # Build location filter
+            try:
+                location_filter = query_builder._build_location_filter(query_params)
+                print(f"Built location filters: {location_filter}")
+            except Exception as e:
+                print(f"Error building location filter: {str(e)}")
+                raise
+
+            # Execute count query first
+            try:
+                count_query = f"""
+                    WITH location_data AS (
+                        SELECT
+                            o.*,
+                            COALESCE(LOWER(m.cfc), LOWER(o.cfc)) as normalized_cfc,
+                            LOWER(m.spoke) as normalized_spoke
+                        FROM `{query_builder.project_id}.{query_builder.dataset_id}.{query_builder._table_name}` o
+                        LEFT JOIN `{query_builder.project_id}.{query_builder.dataset_id}.cfc_spoke_mapping` m
+                        ON LOWER(o.cfc) = LOWER(m.spoke)
+                        WHERE DATE({date_col}) BETWEEN DATE(@start_date) AND DATE(@end_date)
+                    )
+                    SELECT COUNT(*) as count
+                    FROM location_data
+                    WHERE {location_filter}
+                """
+                
+                print("\nExecuting count query:\n")
+                print(count_query)
+                print("\nWith parameters:", json.dumps(query_params, default=str))
+                
+                count_result = self.bigquery_client.execute_query(count_query, query_params)
+                if not count_result or count_result[0]['count'] == 0:
+                    error_msg = f"No {kpi} data found for the specified parameters"
+                    print(f"WARNING: {error_msg}")
+                    return {
+                        "status": "error",
+                        "message": error_msg,
+                        "data": None
+                    }
+                
+                print(f"Found {count_result[0]['count']} matching records")
+
+                # Now execute the main query
+                query = query_builder.build_query(**query_params)
+                print(f"\nExecuting main query:\n{query}")
+                
+                # Execute query
+                results = self.bigquery_client.execute_query(query, query_params)
+                print(f"Main query returned {len(results) if results else 0} rows")
+                
+                if results:
+                    # Calculate summary statistics
+                    summary = self._calculate_summary_stats(results, kpi)
+                    
+                    result = {
+                        "status": "success",
+                        "message": f"Successfully retrieved {kpi} data",
+                        "data": {
+                            "summary": summary,
+                            "data": results
+                        }
+                    }
+                    
+                    print(f"Processed successfully: {result['message']}")
+                    print("Summary statistics:", json.dumps(summary, indent=2))
+                    
+                    return result
+                else:
+                    error_msg = f"Main query returned no results despite count > 0"
+                    print(f"WARNING: {error_msg}")
+                    return {
+                        "status": "error",
+                        "message": error_msg,
+                        "data": None
+                    }
+                    
+            except Exception as query_error:
+                error_msg = f"Error executing {kpi} query: {str(query_error)}"
+                print(f"ERROR: {error_msg}")
+                traceback.print_exc()
+                return {
+                    "status": "error",
+                    "message": error_msg,
+                    "data": None
+                }
+                
+        except Exception as e:
+            error_msg = f"Error processing {kpi} query: {str(e)}"
+            print(f"ERROR: {error_msg}")
+            traceback.print_exc()
+            return {
+                "status": "error",
+                "message": error_msg,
+                "data": None
+            }
+            
+    def _calculate_summary_stats(self, data_points: List[Dict[str, Any]], kpi: str) -> Dict[str, Any]:
+        """Calculate summary statistics using DSPy table definitions"""
+        try:
+            # Get metric fields based on KPI type
+            if kpi == 'orders':
+                metric_fields = ['total_orders']
+            elif kpi == 'atp':
+                metric_fields = ['avg_atp_score', 'total_slots', 'available_slots']
+            else:
+                metric_fields = []
+            
+            if not metric_fields:
+                print(f"WARNING: No metric fields found for {kpi}")
+                return {"error": f"No metric fields found for {kpi}"}
+            
+            # Calculate statistics for each metric
+            summary = {}
+            for metric in metric_fields:
+                values = [float(point[metric]) for point in data_points if metric in point]
+                if values:
+                    summary[metric] = {
+                        "total": sum(values),
+                        "average": round(sum(values) / len(values), 2),
+                        "max": {
+                            "value": max(values),
+                            "details": next(p for p in data_points if float(p[metric]) == max(values))
+                        },
+                        "min": {
+                            "value": min(values),
+                            "details": next(p for p in data_points if float(p[metric]) == min(values))
+                        }
+                    }
+            
+            # Add data points count
+            summary["data_points"] = len(data_points)
+            
+            # Add time range if available
+            if kpi == 'orders':
+                date_field = 'delivery_date'
+            elif kpi == 'atp':
+                date_field = 'slot_date'
+            else:
+                date_field = None
+            
+            if date_field:
+                dates = [point[date_field] for point in data_points if date_field in point]
+                if dates:
+                    summary["date_range"] = {
+                        "start": min(dates),
+                        "end": max(dates)
+                    }
+            
+            return summary
+            
+        except Exception as e:
+            print(f"Error calculating summary statistics: {str(e)}")
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def _build_location_filter(self, params: Dict[str, Any]) -> str:
+        """Build the location filter clause"""
+        filters = []
+        
+        if 'cfc' in params and params['cfc']:
+            if isinstance(params['cfc'], list):
+                # For list of CFCs, use IN clause with case-insensitive comparison
+                filters.append(f"normalized_cfc IN UNNEST(@cfc)")
+            else:
+                # For single CFC, use direct comparison
+                filters.append(f"normalized_cfc = @cfc")
+                
+        if 'spoke' in params and params['spoke'] and params['spoke'] != 'all':
+            if isinstance(params['spoke'], list):
+                # For list of spokes, use IN clause with case-insensitive comparison
+                filters.append(f"normalized_spoke IN UNNEST(@spoke)")
+            else:
+                # For single spoke, use direct comparison
+                filters.append(f"normalized_spoke = @spoke")
+            
+        print(f"Built location filters: {filters}")
+        return ' AND '.join(filters) if filters else '1=1' 
