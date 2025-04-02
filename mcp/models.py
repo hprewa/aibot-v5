@@ -39,6 +39,10 @@ class ConstraintData(BaseModel):
     comparison_type: Optional[str] = None
     tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
     response_plan: Dict[str, Any] = Field(default_factory=dict)
+    # Fields for historical context (for follow-up questions)
+    previous_question: Optional[str] = None
+    previous_summary: Optional[str] = None
+    previous_results: Optional[Dict[str, Any]] = None
 
 class ToolCallData(BaseModel):
     """Data model for a tool call"""

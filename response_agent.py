@@ -174,7 +174,7 @@ class ResponseAgent:
         self.logger.info(f"Keys: {processed_results.keys()}")
         return processed_results
         
-    def _create_response_prompt(self, question: str, results: Dict[str, List[Dict[str, Any]]], 
+    def _create_response_prompt(self, question: str, results: Dict[str, List[Dict[str, Any]]],
                                constraints: Optional[Dict[str, Any]] = None) -> str:
         """
         Create a prompt for generating a response.
@@ -182,7 +182,7 @@ class ResponseAgent:
         Args:
             question: The original user question
             results: Dictionary of query results, keyed by result_id
-            constraints: Optional constraints extracted from the question
+            constraints: Optional constraints extracted from the question, potentially including previous context
             
         Returns:
             A prompt for the Gemini model
@@ -227,34 +227,52 @@ class ResponseAgent:
         # (Assuming constraints provide the intended overall period)
         overall_time_period = constraints.get("time_filter", {}).get("start_date", "unknown") + " to " + constraints.get("time_filter", {}).get("end_date", "unknown")
 
+        # --- Prepare previous context string if available ---
+        previous_context_str = ""
+        if constraints and constraints.get('previous_question'):
+            prev_q = constraints['previous_question']
+            prev_s = constraints.get('previous_summary', 'N/A')
+            # Check if previous_results exists and is not empty or None
+            prev_r_exists = "Yes" if constraints.get('previous_results') else "No"
+            previous_context_str = f"""
+Background from previous conversation turn:
+- Previous Question: "{prev_q}"
+- Previous Summary: "{prev_s}"
+- Previous Data Exists: {prev_r_exists}
+
+Use this context to understand the current question. If it's a follow-up asking for modification (e.g., different breakdown, time range), generate a response based on the *new* data summaries provided below, but acknowledge the change from the previous turn. If the question refers *directly* to the previous data (e.g., "Tell me more about the peak day"), use the previous context (if Previous Data Exists is Yes) along with any new data to answer.
+"""
+        # ---------------------------------------------------
+
         # Generate prompt for Gemini
         prompt = f"""You are a helpful analytics assistant. Generate a concise response to the user's question based on the provided data summaries.
 
-Question: "{question}"
-
-Data Summaries:
+Current Question: "{question}"
+{previous_context_str}
+Data Summaries (for the current question):
 {formatted_summaries}
 
-Overall Time Period for Analysis: {overall_time_period}
+Overall Time Period for Current Analysis: {overall_time_period}
 
 Instructions:
-1. Address the user's question directly. If it's a comparison, explicitly compare the entities ({', '.join(comparison_entities)}).
-2. Synthesize insights from ALL provided data summaries.
-3. Mention the overall time period for the analysis.
-4. Include key statistics (totals, averages, highs, lows) for each entity being discussed.
-5. Format large numbers with commas (e.g., 1,234,567).
-6. Keep the response under 2900 characters.
-7. Use clear paragraph breaks for readability.
-8. Maintain a natural, conversational, and informative tone.
-9. If comparing, clearly state the differences or similarities found.
+1. Address the user's current question directly, considering the previous conversation context if provided.
+2. If it's a follow-up, tailor your response based on the instructions in the 'Background' section above.
+3. Synthesize insights from the *current* data summaries. Reference previous data only if directly relevant to the follow-up question and instructed to do so.
+4. Mention the overall time period for the *current* analysis.
+5. Include key statistics (totals, averages, highs, lows) from the *current* data for each entity being discussed.
+6. Format large numbers with commas (e.g., 1,234,567).
+7. Keep the response under 2900 characters.
+8. Use clear paragraph breaks for readability.
+9. Maintain a natural, conversational, and informative tone.
+10. If comparing, clearly state the differences or similarities found in the *current* data.
 
-Example Comparison Snippet:
-"Comparing {comparison_entities[0]} and {comparison_entities[1]} for the period {overall_time_period}:\n- Total Orders: {comparison_entities[0]} had X orders, while {comparison_entities[1]} had Y orders.\n- Average Daily Orders: {comparison_entities[0]} averaged A orders/day, compared to B orders/day for {comparison_entities[1]}.\n- Peak Day: {comparison_entities[0]}'s busiest day saw P orders, whereas {comparison_entities[1]}'s peak was Q orders."
+Example Comparison Snippet (using current data):
+"Comparing {comparison_entities[0]} and {comparison_entities[1]} for the period {overall_time_period}:\\n- Total Orders: {comparison_entities[0]} had X orders, while {comparison_entities[1]} had Y orders.\\n- Average Daily Orders: {comparison_entities[0]} averaged A orders/day, compared to B orders/day for {comparison_entities[1]}.\\n- Peak Day: {comparison_entities[0]}'s busiest day saw P orders, whereas {comparison_entities[1]}'s peak was Q orders."
 
 Generate the final response based on these instructions and the data provided.
 """
 
-        self.logger.info(f"Generated response prompt for comparison: \n{prompt[:500]}...")
+        self.logger.info(f"Generated response prompt: \n{prompt[:500]}...")
         return prompt
 
     def _format_single_summary(self, summary: Dict[str, Any], data_points: List[Dict[str, Any]], entity_name: str) -> str:

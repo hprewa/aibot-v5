@@ -184,13 +184,14 @@ class MCPRouter:
         self.logger.info(f"Stored session {session_id} in cache")
         self.logger.info(f"Cache now contains {len(session_cache)} sessions")
     
-    def route(self, classification_context: Context[ClassificationData], session_manager=None):
+    def route(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
         """
         Route the question to the appropriate handler based on classification.
         
         Args:
             classification_context: Context containing the question classification
             session_manager: Optional session manager for updating session data
+            previous_context: Optional dictionary containing previous question, summary, results
             
         Returns:
             Context with appropriate response data
@@ -202,12 +203,14 @@ class MCPRouter:
         
         # Route to appropriate handler based on classification
         if question_type in self.route_map:
-            return self.route_map[question_type](classification_context, session_manager)
+            # Pass previous_context to the handler
+            return self.route_map[question_type](classification_context, session_manager, previous_context)
             
         else:
             # Default to full pipeline for unknown types
             self.logger.warning(f"Unknown question type: {question_type}. Defaulting to full pipeline.")
-            return self._handle_full_pipeline(classification_context, session_manager)
+            # Pass previous_context to the default handler too
+            return self._handle_full_pipeline(classification_context, session_manager, previous_context)
     
     def _create_response_context(self, classification_context: Context[ClassificationData], response_data: ResponseData):
         """Create a response context with appropriate metadata"""
@@ -224,10 +227,14 @@ class MCPRouter:
         
         return Context(data=response_data, metadata=metadata)
     
-    def _handle_full_pipeline(self, classification_context: Context[ClassificationData], session_manager=None):
+    def _handle_full_pipeline(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
         """Process through the complete MCP pipeline."""
         classification = classification_context.data
         self.logger.info(f"Handling full pipeline for: {classification.question}")
+        # Log if previous context is present
+        if previous_context:
+            self.logger.info("Received previous context for full pipeline.")
+            self.logger.info(f"  Prev Q: {previous_context.get('previous_question', 'N/A')[:100]}...")
         
         # Get session ID and user ID
         session_id = classification_context.metadata.session_id
@@ -261,11 +268,21 @@ class MCPRouter:
                     session_manager.create_session(user_id, classification.question, session_id)
                     self.logger.info(f"Created new session {session_id} for user {user_id} with question: {classification.question}")
             
-            # Step 1: Extract constraints
+            # Step 1: Extract constraints, passing previous_context
             self.logger.info("Extracting constraints...")
-            constraints = self.query_processor.extract_constraints(classification.question)
+            # Pass previous_context to extract_constraints
+            constraints = self.query_processor.extract_constraints(
+                classification.question,
+                previous_context=previous_context # Pass the argument here
+            )
             self.logger.info(f"Extracted constraints: {json.dumps(constraints, indent=2)}")
             
+            # Add previous context to the constraints dict itself so it's available later if needed
+            if previous_context:
+                constraints['previous_question'] = previous_context.get('previous_question')
+                constraints['previous_summary'] = previous_context.get('previous_summary')
+                constraints['previous_results'] = previous_context.get('previous_results')
+
             # Step 2: Generate SQL queries
             self.logger.info("Generating SQL queries...")
             tool_calls = []
@@ -500,7 +517,7 @@ class MCPRouter:
             traceback.print_exc()
             return self._create_error_response(classification_context, str(e))
     
-    def _handle_planned_feature(self, classification_context: Context[ClassificationData], session_manager=None):
+    def _handle_planned_feature(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
         """Handle a feature that is planned but not yet implemented."""
         classification = classification_context.data
         self.logger.info(f"Routing planned feature: {classification.question_type}")
@@ -511,7 +528,7 @@ class MCPRouter:
         )
         return self._create_response_context(classification_context, response_data)
     
-    def _handle_unsupported_feature(self, classification_context: Context[ClassificationData], session_manager=None):
+    def _handle_unsupported_feature(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
         """Handle an unsupported feature request."""
         classification = classification_context.data
         self.logger.info(f"Routing unsupported feature: {classification.question}")
@@ -522,7 +539,7 @@ class MCPRouter:
         )
         return self._create_response_context(classification_context, response_data)
     
-    def _handle_clarification_needed(self, classification_context: Context[ClassificationData], session_manager=None):
+    def _handle_clarification_needed(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
         """Handle a question that needs clarification."""
         classification = classification_context.data
         self.logger.info(f"Routing clarification needed: {classification.question}")
@@ -533,7 +550,7 @@ class MCPRouter:
         )
         return self._create_response_context(classification_context, response_data)
     
-    def _handle_small_talk(self, classification_context: Context[ClassificationData], session_manager=None):
+    def _handle_small_talk(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
         """Handle small talk with a friendly response."""
         classification = classification_context.data
         self.logger.info(f"Routing small talk: {classification.question}")
@@ -544,7 +561,7 @@ class MCPRouter:
         )
         return self._create_response_context(classification_context, response_data)
     
-    def _handle_feedback(self, classification_context: Context[ClassificationData], session_manager=None):
+    def _handle_feedback(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
         """Handle feedback by thanking the user and storing the feedback."""
         classification = classification_context.data
         self.logger.info(f"Routing feedback: {classification.question}")

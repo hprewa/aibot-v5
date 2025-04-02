@@ -1344,20 +1344,56 @@ class MCPQueryFlowOrchestrator:
             classification_data = classification_context.data
             print(f"📊 Question classified as {classification_data.question_type} with confidence {classification_data.confidence}")
             
+            # --- Add logic to fetch previous session context for follow-up questions ---
+            previous_context = {}
+            if classification_data.question_type == "Follow-up question":
+                print(f"🔍 Detected follow-up question for session {session_id}. Fetching previous context...")
+                try:
+                    # Use the *underlying* session manager to fetch data directly
+                    if hasattr(self.session_manager, 'session_manager') and self.session_manager.session_manager:
+                        previous_session = self.session_manager.session_manager.get_session(session_id)
+                        if previous_session:
+                            previous_context['previous_question'] = previous_session.get('question')
+                            previous_context['previous_summary'] = previous_session.get('summary')
+                            previous_context['previous_results'] = previous_session.get('results') # Assumes results are stored appropriately
+                            print("✅ Successfully fetched previous context.")
+                            # Log fetched context previews
+                            print(f"  Prev Q: {previous_context['previous_question'][:100]}...")
+                            print(f"  Prev S: {previous_context['previous_summary'][:100]}...")
+                            # Note: Printing results can be large, skip detailed log here
+                        else:
+                            print(f"⚠️ Previous session {session_id} not found.")
+                    else:
+                        print("⚠️ Cannot fetch previous session: underlying session manager not available.")
+                except Exception as e:
+                    print(f"❌ Error fetching previous session context: {str(e)}")
+                    traceback.print_exc()
+            # -----------------------------------------------------------------------
+
             # Step 3: Extract constraints if needed (for some query types)
             constraint_context = None
             strategy_context = None
             execution_context = None
             response_context = None
             
-            # Instead of completing the full pipeline, use our router
+            # Update the query processor call to include previous context if available
+            # This assumes the query processor is called before the router for relevant types
+            # Note: The current orchestrator logic relies heavily on the router. 
+            # We need to adjust the flow to ensure constraints (with potential previous context) 
+            # are extracted *before* routing, or adjust the router itself.
+            # For now, we'll modify the assumption that the router handles the pipeline.
+            # Let's modify the router's _handle_full_pipeline to accept previous_context
+            
+            # Instead of completing the full pipeline here, use our router
             # to determine the next steps based on classification
             if hasattr(self, 'router') and self.router:
                 try:
                     # Make sure we pass the underlying session_manager object, not the wrapper
+                    # Also pass the fetched previous_context to the router
                     response_context = self.router.route(
                         classification_context, 
-                        self.session_manager.session_manager if hasattr(self.session_manager, 'session_manager') else None
+                        self.session_manager.session_manager if hasattr(self.session_manager, 'session_manager') else None,
+                        previous_context=previous_context # Pass the fetched context
                     )
                 except Exception as e:
                     error_msg = f"Error routing question: {str(e)}"

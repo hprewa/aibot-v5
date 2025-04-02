@@ -47,7 +47,7 @@ class QueryProcessor:
             """
         }
         
-    def extract_constraints(self, question: str) -> Dict[str, Any]:
+    def extract_constraints(self, question: str, previous_context: Optional[Dict] = None) -> Dict[str, Any]:
         """Extract constraints using Gemini Flash thinking 2.0"""
         try:
             # Get current date and calculate time ranges
@@ -67,9 +67,28 @@ class QueryProcessor:
             
             # Get schema context
             schema_context = self._get_schema_context()
-            
+
+            # --- Prepare previous context string for the prompt ---
+            previous_context_str = ""
+            if previous_context:
+                prev_q = previous_context.get('previous_question', 'N/A')
+                prev_s = previous_context.get('previous_summary', 'N/A')
+                # Avoid adding large results to the prompt, just mention they exist
+                prev_r_exists = "Yes" if previous_context.get('previous_results') else "No"
+                previous_context_str = f"""
+Previous conversation turn:
+- Previous Question: "{prev_q}"
+- Previous Summary: "{prev_s}"
+- Previous Data Exists: {prev_r_exists}
+
+Please consider this previous context when extracting constraints for the current question. If the current question modifies the previous one (e.g., asks for a different breakdown, time period, or location), adjust the constraints accordingly. If it refers to the previous data, reflect that in the response plan.
+"""
+            # ----------------------------------------------------
+
             prompt = f"""You are a Flash Thinking 2.0 constraint extractor for a SQL query generator.
 Given this question: "{question}"
+
+{previous_context_str} # Include previous context here
 
 Available tables and their schemas:
 {schema_context}
@@ -144,30 +163,32 @@ Please extract the constraints and format them EXACTLY as a JSON object with the
 }}
 
 IMPORTANT:
-1. Only include fields that are explicitly or implicitly mentioned in the question
-2. Return ONLY the JSON object, no other text
-3. Ensure the JSON is properly formatted with double quotes
-4. For dates, use the provided date calculations above
-5. For comparison_type:
-   - Use "trend" for time-based analysis
-   - Use "between_locations" for location comparisons
-   - Use "null" for simple queries
-6. For cfc and spokes:
-   - cfc should be empty list for network-level questions
-   - spokes should be "all" if all spokes are needed
-   - Both should be empty lists if not mentioned
-   - Only use CFCs and spokes from the provided lists
-7. For tool_calls:
-   - List all BigQuery queries that will be needed
-   - Each query should have a descriptive name and purpose
-   - Include all tables that will be needed for each query
-   - Assign a unique result_id to each tool call
-   - **IMPORTANT FOR COMPARISONS:** If `comparison_type` is "between_locations" or "time_periods", create a *separate tool call for each location or time period being compared*. Each tool call should fetch data for only *one* specific entity (e.g., one CFC, one time range). The `result_id` should clearly indicate which entity it belongs to (e.g., `orders_london_2024`, `orders_stevenage_2024`).
-8. For response_plan:
-   - Create a clear plan for how the Response agent should handle results
-   - Link each tool call result to specific insights
-   - If multiple tool calls were generated for a comparison, ensure the plan details how to combine/compare their `result_id`s.
-   - Provide a structured outline for the final response
+1. **Crucially, if `Previous Data Exists: Yes`, examine the structure/content of the previous data based on the `Previous Summary` and `Previous Question`. If the current question asks for information *already contained* within that previous data (e.g., asking for a monthly breakdown when the previous results *were* monthly, or asking for details about a specific location already present), then **DO NOT** generate a new `tool_call`. Instead, set `tool_calls: []` and update the `response_plan` to indicate the answer should be derived *directly* from the previous results.**
+2.  Only generate new `tool_calls` if the current question genuinely requires fetching *new* data (e.g., a different KPI, a different primary location, a different time range, or a breakdown not present previously).
+3.  Only include fields that are explicitly or implicitly mentioned in the question
+4.  Return ONLY the JSON object, no other text
+5.  Ensure the JSON is properly formatted with double quotes
+6.  For dates, use the provided date calculations above
+7.  For comparison_type:
+    - Use "trend" for time-based analysis
+    - Use "between_locations" for location comparisons
+    - Use "null" for simple queries
+8.  For cfc and spokes:
+    - cfc should be empty list for network-level questions
+    - spokes should be "all" if all spokes are needed
+    - Both should be empty lists if not mentioned
+    - Only use CFCs and spokes from the provided lists
+9.  For tool_calls (if generated):
+    - List all BigQuery queries that will be needed
+    - Each query should have a descriptive name and purpose
+    - Include all tables that will be needed for each query
+    - Assign a unique result_id to each tool call
+    - **IMPORTANT FOR COMPARISONS:** If `comparison_type` is "between_locations" or "time_periods", create a *separate tool call for each location or time period being compared*. Each tool call should fetch data for only *one* specific entity (e.g., one CFC, one time range). The `result_id` should clearly indicate which entity it belongs to (e.g., `orders_london_2024`, `orders_stevenage_2024`).
+10. For response_plan:
+    - Create a clear plan for how the Response agent should handle results
+    - Link each tool call result (if any) to specific insights
+    - If no tool calls are needed because the answer is in previous results, specify that in the plan (e.g., in `processing_steps` or `purpose` for a dummy `data_connection` referencing previous data).
+    - Provide a structured outline for the final response
 """
             
             # --- Try calling Gemini and parsing --- 
