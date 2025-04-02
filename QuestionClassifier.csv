@@ -7,29 +7,33 @@ What are the peak ATP months in 2024"
 5,Anamoly Detection,Users want to understand reasons behind KPI fluctuations.,Why did ATP drop in January 2025
 6,Operational efficiency,Users want performance insights beyond just KPI values,Which CFC had highest Perfect order values?
 7,Constrained Based Optimization,Users need optimal actions based on constraints,"How should I allocate inventory across warehouses?
-What’s the best way to reduce delivery delays?
+What's the best way to reduce delivery delays?
 How can we improve profit margins in Q2?"
 8,Exception Handling and Alert ,Users need for threshold-based monitoring.,"Alert me if perfect orders drops below 83%.
 Are there any KPI anamolies today"
 9,Metadata and Schema,Users asks about data structure or ai chatbot capabilities instead of KPI values.,"What KPIs can I query?
 Which locations are available in the database?
 What can you help me with?"
-10,Unsupported/Random Questions,Questions that don’t fit the system’s purpose.,"Who is the CEO of Tesla?
+10,Unsupported/Random Questions,Questions that don't fit the system's purpose.,"Who is the CEO of Tesla?
 Tell me a joke.
-What’s the weather in New York?
+What's the weather in New York?
 "
-11,Ambiguous Questions/ Questions with incomplete information,Unclear User Intent,"Show me last week's report. (Report of what?)
-How did we do in Q4? (What KPI?)"
+11,Ambiguous Questions/ Questions with incomplete information,"Unclear User Intent","Show me last week's report. (Report of what?)
+How did we do in Q4? (What KPI?)
+What were orders? (Missing time and location)
+Show me orders for London (Missing time)
+What happened last week? (Missing KPI and location)
+Compare orders (Missing locations/time periods to compare)"
 12,Multi-Intent Questions,User combines two category of questions,Compare last week's orders with last month and predict next week's trend.
-13,KPI Constraints & Unknown KPIs,Users might request a derived KPI that isn’t stored but can be computed.,"Find profit margin for last quarter. (What if ""profit margin"" isn't stored as a KPI?)
+13,KPI Constraints & Unknown KPIs,Users might request a derived KPI that isn't stored but can be computed.,"Find profit margin for last quarter. (What if ""profit margin"" isn't stored as a KPI?)
 Show lost revenue due to stockouts."" (Might not be directly available.)"
-14,Nested or Multi-Step,USer questions that require multiple dependent steps,"Get last month’s revenue, then compare it with last year’s same month and show percentage growth.
+14,Nested or Multi-Step,USer questions that require multiple dependent steps,"Get last month's revenue, then compare it with last year's same month and show percentage growth.
 Fetch all KPIs for New York and then summarize the top 3 insights"
-15,Data Availability Issues,"User may ask about kpi, cfc, spoke or timeperiod which doesn't exist",Find customer churn rate (but we don’t store churn data).
+15,Data Availability Issues,"User may ask about kpi, cfc, spoke or timeperiod which doesn't exist",Find customer churn rate (but we don't store churn data).
 16," Unsupported NLP Constructs (Complex Language)
 ",,"Could you kindly tell me the average sales for Q1?
 Between London and Paris, which city sold more units last quarter?"
-17,Action-Based Questions,Users might request actions rather than just data.,"""Email me last month’s sales report.""
+17,Action-Based Questions,Users might request actions rather than just data.,"""Email me last month's sales report.""
 ""Generate PowerPoint from these insights.""
 "
 

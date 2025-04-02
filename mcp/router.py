@@ -132,6 +132,8 @@ class MCPRouter:
     # Special handling categories
     SMALL_TALK_CATEGORY = "Small Talk"
     FEEDBACK_CATEGORY = "Feedback"
+    AMBIGUOUS_CATEGORY = "Ambiguous Questions"
+    UNSUPPORTED_CONSTRUCT_CATEGORY = "Unsupported NLP Constructs"
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
@@ -168,6 +170,8 @@ class MCPRouter:
             "other analytics": self._handle_full_pipeline,
             "forecasting": self._handle_planned_feature,
             "unsupported/random questions": self._handle_unsupported_feature,
+            "ambiguous questions": self._handle_ambiguous_question,
+            "unsupported nlp constructs": self._handle_unsupported_construct,
             "data source": self._handle_clarification_needed,
             "clarification needed": self._handle_clarification_needed,
             "small talk": self._handle_small_talk,
@@ -739,6 +743,148 @@ class MCPRouter:
         )
         
         return Context(data=response_data, metadata=metadata)
+    
+    def _handle_ambiguous_question(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
+        """Handle ambiguous questions by asking for clarification."""
+        classification = classification_context.data
+        question = classification.question
+        session_id = classification_context.metadata.session_id
+        user_id = classification_context.metadata.user_id or getattr(classification_context.data, 'user_id', 'anonymous')
+        
+        self.logger.info(f"Handling ambiguous question: {question}")
+        
+        clarification_needed = []
+        partial_constraints = None
+        
+        try:
+            # Attempt to extract constraints to see what's missing
+            # Pass previous_context if available
+            partial_constraints = self.query_processor.extract_constraints(
+                question,
+                previous_context=previous_context
+            )
+            self.logger.info(f"Partial constraints extracted: {json.dumps(partial_constraints, indent=2)}")
+            
+            # --- Refined Checks for Missing Information ---
+            
+            # Check 1: Missing KPI
+            # Force missing KPI if the question used generic term "kpi" or similar,
+            # OR if the extractor returned an empty list.
+            generic_kpi_term_used = any(term in question.lower() for term in [" kpi", " metric", " measure"])
+            if generic_kpi_term_used or not partial_constraints.get("kpi"):
+                clarification_needed.append("which specific KPI (e.g., orders, ATP)")
+            
+            # Check 2: Missing Time Period
+            time_filter = partial_constraints.get("time_filter", {})
+            if not time_filter or not time_filter.get("start_date") or not time_filter.get("end_date"):
+                 # Check if specific time keywords were actually used in the question
+                 # This prevents asking for time if the extractor defaulted but user didn't specify
+                 time_keywords = ["last week", "month", "january", "february", "march", "april", "may", "june", 
+                                  "july", "august", "september", "october", "november", "december", 
+                                  "quarter", "year", "today", "yesterday", "\d{4}"] # Basic check for year
+                 if any(keyword in question.lower() for keyword in time_keywords):
+                     # User likely mentioned time, but extractor failed
+                     clarification_needed.append("the time period (e.g., last week, January 2024)")
+                 # If no time keywords found, maybe user didn't intend to specify time - don't ask? 
+                 # Let's still ask for now, as most KPIs need time.
+                 elif "the time period (e.g., last week, January 2024)" not in clarification_needed:
+                    clarification_needed.append("the time period (e.g., last week, January 2024)")
+
+            # Check 3: Missing Location
+            # Only ask if relevant KPI was extracted OR if the generic term "kpi" was used
+            extracted_kpi = partial_constraints.get("kpi", [])
+            kpi_requires_location = any(k in ["orders", "atp"] for k in extracted_kpi)
+            location_keywords = ["cfc", "spoke", "network"] + [cfc.lower() for cfc in self.query_processor.bigquery_client.get_cfc_spoke_mapping().keys()] # Add known CFCs
+            
+            if (kpi_requires_location or generic_kpi_term_used) and not partial_constraints.get("cfc") and not partial_constraints.get("spokes"):
+                 # Also check if user actually mentioned a location term
+                 if any(keyword in question.lower() for keyword in location_keywords):
+                    # User mentioned location, but extractor missed it
+                    clarification_needed.append("the location (e.g., a specific CFC, spoke, or the entire network)")
+                 # If no location term found, and it's required, ask for it.
+                 elif "the location (e.g., a specific CFC, spoke, or the entire network)" not in clarification_needed:
+                    clarification_needed.append("the location (e.g., a specific CFC, spoke, or the entire network)")
+            # --- End Refined Checks ---
+
+        except Exception as e:
+            self.logger.error(f"Error extracting partial constraints for ambiguous question: {str(e)}")
+            # Fallback to generic clarification if extraction fails
+            clarification_needed = ["more details about what specific data or metrics you're interested in"]
+
+        # Formulate clarification message
+        if clarification_needed:
+            # Check if the list is non-empty BEFORE joining
+            if clarification_needed:
+                missing_info = " and ".join(clarification_needed)
+                summary = f"To help me answer your question, could you please specify {missing_info}?"
+            else:
+                 # Should not happen if the initial check is done right, but as a fallback:
+                 summary = "I understand you're asking about something, but could you please provide a bit more detail? For example, specify the KPI, time period, and location."
+        else:
+            # If extraction succeeded but somehow nothing was marked as needed (unlikely but possible)
+            summary = "I seem to have all the details, but I'm still unsure how to proceed. Could you please rephrase your request?"
+
+        self.logger.info(f"Generated clarification message: {summary}")
+
+        # Create response data
+        response_data = ResponseData(
+            query=question,
+            summary=summary,
+            created_at=datetime.now()
+        )
+
+        # Update session status and store partial context
+        if session_manager and session_id:
+            try:
+                update_data = {
+                    "status": "awaiting_clarification",
+                    "summary": summary, # Store the question asked to the user
+                    "updated_at": datetime.now().isoformat()
+                }
+                # Store partial constraints if extracted
+                if partial_constraints:
+                    # Ensure constraints are serializable
+                    try:
+                        update_data["constraints"] = json.loads(json.dumps(partial_constraints, cls=DateTimeEncoder))
+                    except Exception as json_err:
+                        self.logger.error(f"Could not serialize partial constraints: {json_err}")
+                        update_data["constraints"] = {"error": "Could not store partial constraints"}
+                
+                session_manager.update_session(session_id, update_data)
+                self.logger.info(f"Updated session {session_id} status to awaiting_clarification")
+            except Exception as e:
+                self.logger.error(f"Error updating session for ambiguous question: {str(e)}")
+                traceback.print_exc()
+        
+        # Create and return the response context
+        return self._create_response_context(classification_context, response_data)
+    
+    def _handle_unsupported_construct(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
+        """Handle questions classified as having unsupported NLP constructs."""
+        classification = classification_context.data
+        self.logger.info(f"Handling unsupported NLP construct: {classification.question}")
+        
+        # Provide a simple response indicating inability to process
+        response_data = ResponseData(
+            query=classification.question,
+            summary="I'm sorry, I had trouble understanding the structure of your request. Could you please try rephrasing it as a question about specific KPIs, locations, or time periods?"
+        )
+        
+        # Optionally update session status if needed (e.g., mark as failed/unsupported)
+        session_id = classification_context.metadata.session_id
+        if session_manager and session_id:
+            try:
+                update_data = {
+                    "status": "failed_unsupported_construct",
+                    "summary": response_data.summary,
+                    "updated_at": datetime.now().isoformat()
+                }
+                session_manager.update_session(session_id, update_data)
+                self.logger.info(f"Updated session {session_id} status to failed_unsupported_construct")
+            except Exception as e:
+                self.logger.error(f"Error updating session for unsupported construct: {str(e)}")
+
+        return self._create_response_context(classification_context, response_data)
     
     def _create_error_response(self, context: Context[ClassificationData], error_message: str) -> Context[ResponseData]:
         """Create an error response context"""
