@@ -189,6 +189,10 @@ class ResponseAgent:
         """
         self.logger.info("\nCreating response prompt...")
         
+        # Get time aggregation from constraints, default to Daily
+        time_aggregation = constraints.get("time_aggregation", "Daily") if constraints else "Daily"
+        self.logger.info(f"Using time aggregation for summary formatting: {time_aggregation}")
+
         # Format the data for the prompt
         # Handle multiple results for comparisons
         all_summaries = []
@@ -205,8 +209,8 @@ class ResponseAgent:
                 entity_name = summary.get("location") or summary.get("time_period") or result_id
                 comparison_entities.append(entity_name)
                 
-                # Format summary for this entity
-                entity_summary = self._format_single_summary(summary, data_points, entity_name)
+                # Format summary for this entity, passing the time aggregation level
+                entity_summary = self._format_single_summary(summary, data_points, entity_name, time_aggregation)
                 all_summaries.append(entity_summary)
                 all_data_points.extend(data_points)
             else:
@@ -260,14 +264,24 @@ Instructions:
 3. Synthesize insights from the *current* data summaries. Reference previous data only if directly relevant to the follow-up question and instructed to do so.
 4. Mention the overall time period for the *current* analysis.
 5. Include key statistics (totals, averages, highs, lows) from the *current* data for each entity being discussed.
-6. Format large numbers with commas (e.g., 1,234,567).
-7. Keep the response under 2900 characters.
-8. Use clear paragraph breaks for readability.
-9. Maintain a natural, conversational, and informative tone.
-10. If comparing, clearly state the differences or similarities found in the *current* data.
+6. **If analyzing a trend over time (check constraints or response plan):**
+    - Identify the overall trend (e.g., increasing, decreasing, stable).
+    - Quantify the trend if possible (e.g., "increased by X% overall", "average monthly growth of Y").
+    - Point out significant periods (e.g., peaks, troughs, periods of acceleration/deceleration).
+    - Provide a concluding sentence summarizing the trend's significance.
+7. **If comparing entities (check constraints or response plan):**
+    - Clearly state the differences or similarities found in the *current* data.
+    - Use comparative language (e.g., "higher than", "lower than", "similar to").
+8. Format large numbers with commas (e.g., 1,234,567).
+9. Keep the response under 2900 characters.
+10. Use clear paragraph breaks for readability.
+11. Maintain a natural, conversational, and informative tone suitable for leadership (concise, clear, highlights key takeaways).
 
 Example Comparison Snippet (using current data):
-"Comparing {comparison_entities[0]} and {comparison_entities[1]} for the period {overall_time_period}:\\n- Total Orders: {comparison_entities[0]} had X orders, while {comparison_entities[1]} had Y orders.\\n- Average Daily Orders: {comparison_entities[0]} averaged A orders/day, compared to B orders/day for {comparison_entities[1]}.\\n- Peak Day: {comparison_entities[0]}'s busiest day saw P orders, whereas {comparison_entities[1]}'s peak was Q orders."
+"Comparing {comparison_entities[0] if comparison_entities else 'Entity A'} and {comparison_entities[1] if len(comparison_entities) > 1 else 'Entity B'} for the period {overall_time_period}:\\n- Total Orders: {comparison_entities[0] if comparison_entities else 'Entity A'} had X orders, while {comparison_entities[1] if len(comparison_entities) > 1 else 'Entity B'} had Y orders.\\n- Average Daily Orders: {comparison_entities[0] if comparison_entities else 'Entity A'} averaged A orders/day, compared to B orders/day for {comparison_entities[1] if len(comparison_entities) > 1 else 'Entity B'}.\\n- Peak Day: {comparison_entities[0] if comparison_entities else 'Entity A'}'s busiest day saw P orders, whereas {comparison_entities[1] if len(comparison_entities) > 1 else 'Entity B'}'s peak was Q orders."
+
+Example Trend Analysis Snippet (using current data):
+"Analyzing the trend for {comparison_entities[0] if comparison_entities else 'the metric'} over the period {overall_time_period}:\\n- Overall Trend: Orders showed an upward trend, increasing by Z% from the beginning to the end of the period.\\n- Key Periods: The most significant growth occurred in [Month/Week], while a slight dip was observed in [Month/Week]. The peak was reached on [Date] with P orders.\\n- Average Change: On average, orders grew by C units per [Day/Week/Month].\\n- Conclusion: The consistent upward trend suggests growing demand during this timeframe."
 
 Generate the final response based on these instructions and the data provided.
 """
@@ -275,7 +289,7 @@ Generate the final response based on these instructions and the data provided.
         self.logger.info(f"Generated response prompt: \n{prompt[:500]}...")
         return prompt
 
-    def _format_single_summary(self, summary: Dict[str, Any], data_points: List[Dict[str, Any]], entity_name: str) -> str:
+    def _format_single_summary(self, summary: Dict[str, Any], data_points: List[Dict[str, Any]], entity_name: str, time_aggregation: str = "Daily") -> str:
         """Helper function to format the summary section for a single entity."""
         summary_points = []
         summary_points.append(f"**Summary for {entity_name}:**")
@@ -283,19 +297,31 @@ Generate the final response based on these instructions and the data provided.
         summary_points.append(f"- Location/Entity: {summary.get('location', entity_name)}") # Use entity_name as fallback
         summary_points.append(f"- Total Records Analyzed: {summary.get('total_records', len(data_points))}")
 
+        # Determine time unit based on aggregation
+        time_unit = "Day"
+        if time_aggregation.lower() == "weekly":
+            time_unit = "Week"
+        elif time_aggregation.lower() == "monthly":
+            time_unit = "Month"
+        elif time_aggregation.lower() == "quarterly":
+            time_unit = "Quarter"
+        elif time_aggregation.lower() == "yearly":
+            time_unit = "Year"
+        # Add other units as needed (e.g., Hourly)
+
         # Add order statistics if available
         order_stats = summary.get('total_orders', {})
         if order_stats:
-            summary_points.append("- Order Statistics:")
+            summary_points.append(f"- Order Statistics ({time_aggregation}):") # Indicate aggregation level
             # Ensure values exist and format them
             total = order_stats.get('total', 0)
             avg = order_stats.get('average', 0)
             max_val = order_stats.get('max', 0)
             min_val = order_stats.get('min', 0)
             summary_points.append(f"  - Total Orders: {total:,.0f}")
-            summary_points.append(f"  - Average Orders per Day: {avg:,.2f}")
-            summary_points.append(f"  - Maximum Orders in a Day: {max_val:,.0f}")
-            summary_points.append(f"  - Minimum Orders in a Day: {min_val:,.0f}")
+            summary_points.append(f"  - Average Orders per {time_unit}: {avg:,.2f}")
+            summary_points.append(f"  - Maximum Orders in a {time_unit}: {max_val:,.0f}")
+            summary_points.append(f"  - Minimum Orders in a {time_unit}: {min_val:,.0f}")
         else:
              # Attempt to calculate from raw data if summary is missing stats
              if data_points and 'total_orders' in data_points[0]:
@@ -305,11 +331,11 @@ Generate the final response based on these instructions and the data provided.
                      avg = total / len(order_values) if order_values else 0
                      max_val = max(order_values) if order_values else 0
                      min_val = min(order_values) if order_values else 0
-                     summary_points.append("- Order Statistics (Calculated):")
+                     summary_points.append(f"- Order Statistics (Calculated, {time_aggregation}):")
                      summary_points.append(f"  - Total Orders: {total:,.0f}")
-                     summary_points.append(f"  - Average Orders per Day: {avg:,.2f}")
-                     summary_points.append(f"  - Maximum Orders in a Day: {max_val:,.0f}")
-                     summary_points.append(f"  - Minimum Orders in a Day: {min_val:,.0f}")
+                     summary_points.append(f"  - Average Orders per {time_unit}: {avg:,.2f}")
+                     summary_points.append(f"  - Maximum Orders in a {time_unit}: {max_val:,.0f}")
+                     summary_points.append(f"  - Minimum Orders in a {time_unit}: {min_val:,.0f}")
                  except KeyError:
                      summary_points.append("- Order statistics could not be calculated from data points.")
              else:
