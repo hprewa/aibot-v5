@@ -172,6 +172,7 @@ class MCPRouter:
             "categorical breakdown": self._handle_full_pipeline,
             "ranking": self._handle_full_pipeline,
             "other analytics": self._handle_full_pipeline,
+            "follow-up question": self._handle_follow_up,
             "forecasting": self._handle_planned_feature,
             "unsupported/random questions": self._handle_unsupported_feature,
             "ambiguous questions": self._handle_ambiguous_question,
@@ -1064,6 +1065,123 @@ class MCPRouter:
                 self.logger.error(f"Error updating session for unsupported construct: {str(e)}")
 
         return self._create_response_context(classification_context, response_data)
+    
+    def _handle_follow_up(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None, send_callback: Optional[Callable] = None):
+        """Handle follow-up questions by reusing previous context and data, falling back to full pipeline if needed."""
+        classification = classification_context.data
+        session_id = classification_context.metadata.session_id
+        self.logger.info(f"Handling follow-up question: {classification.question}")
+        
+        try:
+            # Check if we have previous context
+            if not previous_context:
+                self.logger.warning("No previous context available for follow-up question, falling back to full pipeline")
+                return self._handle_full_pipeline(classification_context, session_manager, previous_context, send_callback)
+            
+            # Get previous results and constraints
+            previous_results = previous_context.get('previous_results', {})
+            previous_constraints = previous_context.get('constraints', {})
+            
+            if not previous_results:
+                self.logger.warning("No previous results available for follow-up question, falling back to full pipeline")
+                return self._handle_full_pipeline(classification_context, session_manager, previous_context, send_callback)
+            
+            # Extract current constraints from classification metadata
+            current_constraints = classification.classification_metadata.get('constraints', {})
+            
+            # Filter previous results based on current constraints
+            filtered_results = {}
+            for result_id, result in previous_results.items():
+                if result.get('status') == 'success':
+                    data = result.get('data', {}).get('data', [])
+                    filtered_data = []
+                    
+                    # Filter data based on time constraints
+                    time_filter = current_constraints.get('time_filter', {})
+                    if time_filter:
+                        start_date = datetime.fromisoformat(time_filter.get('start_date', '1900-01-01'))
+                        end_date = datetime.fromisoformat(time_filter.get('end_date', '2100-12-31'))
+                        
+                        for point in data:
+                            point_date = datetime.fromisoformat(point.get('week_start_date', '1900-01-01'))
+                            if start_date <= point_date <= end_date:
+                                filtered_data.append(point)
+                    
+                    if filtered_data:
+                        filtered_results[result_id] = {
+                            'status': 'success',
+                            'data': {
+                                'data': filtered_data,
+                                'summary': result.get('data', {}).get('summary', {})
+                            }
+                        }
+            
+            if not filtered_results:
+                self.logger.warning("No data matching the follow-up constraints found in previous results, falling back to full pipeline")
+                return self._handle_full_pipeline(classification_context, session_manager, previous_context, send_callback)
+            
+            # Generate response using filtered data
+            response_data = ResponseData(
+                query=classification.question,
+                summary=self._generate_follow_up_summary(filtered_results, current_constraints, previous_context)
+            )
+            
+            # Generate graph if appropriate
+            if send_callback and self._should_generate_graph(classification.question_type, current_constraints):
+                try:
+                    graph_path = self._generate_and_save_graph(
+                        filtered_results,
+                        current_constraints,
+                        session_id,
+                        session_manager,
+                        send_callback
+                    )
+                    if graph_path:
+                        response_data.graph_path = graph_path
+                except Exception as e:
+                    self.logger.error(f"Error generating graph for follow-up: {str(e)}")
+            
+            return self._create_response_context(classification_context, response_data)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling follow-up question: {str(e)}")
+            traceback.print_exc()
+            return self._create_error_response(
+                classification_context,
+                f"An error occurred while processing your follow-up question: {str(e)}"
+            )
+    
+    def _generate_follow_up_summary(self, results: Dict, constraints: Dict, previous_context: Dict) -> str:
+        """Generate a summary for follow-up question results."""
+        try:
+            # Extract key information
+            time_filter = constraints.get('time_filter', {})
+            time_period = f"{time_filter.get('start_date')} to {time_filter.get('end_date')}"
+            
+            # Build summary
+            summary_parts = []
+            summary_parts.append(f"Here's the analysis for {time_period} based on your previous question:")
+            
+            # Add data points
+            for result_id, result in results.items():
+                if result.get('status') == 'success':
+                    data = result.get('data', {}).get('data', [])
+                    summary = result.get('data', {}).get('summary', {})
+                    
+                    if data:
+                        location = summary.get('location', result_id)
+                        total_orders = sum(point.get('total_orders', 0) for point in data)
+                        avg_orders = total_orders / len(data) if data else 0
+                        
+                        summary_parts.append(f"\n*{location}:*")
+                        summary_parts.append(f"• Total Orders: {total_orders:,}")
+                        summary_parts.append(f"• Average Weekly Orders: {avg_orders:,.2f}")
+            
+            return "\n".join(summary_parts)
+            
+        except Exception as e:
+            self.logger.error(f"Error generating follow-up summary: {str(e)}")
+            return "Here's the analysis for the requested time period based on your previous question."
     
     def _create_error_response(self, context: Context[ClassificationData], error_message: str) -> Context[ResponseData]:
         """Create an error response context"""
