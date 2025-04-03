@@ -5,7 +5,7 @@ This module contains the router class that routes questions based on their class
 to the appropriate handlers.
 """
 
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Callable
 from datetime import datetime
 import json
 import logging
@@ -27,6 +27,8 @@ from query_agent import QueryAgent
 from response_agent import ResponseAgent, DateTimeEncoder
 from bigquery_client import BigQueryClient
 from gemini_client import GeminiClient
+from graph_generator import GraphGenerator
+from session_manager_v2 import SessionManagerV2
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -146,12 +148,14 @@ class MCPRouter:
         self.query_processor = QueryProcessor(clients.gemini, clients.bigquery)
         self.query_agent = QueryAgent(clients.gemini)
         self.response_agent = ResponseAgent(clients.gemini)
+        self.graph_generator = GraphGenerator()
         
         # Log instance IDs during initialization
         self.logger.info(f"Router Init: Router ID = {id(self)}")
         self.logger.info(f"Router Init: QueryProcessor ID = {id(self.query_processor)}")
         self.logger.info(f"Router Init: QueryAgent ID = {id(self.query_agent)}")
         self.logger.info(f"Router Init: ResponseAgent ID = {id(self.response_agent)}")
+        self.logger.info(f"Router Init: GraphGenerator ID = {id(self.graph_generator)}")
         if hasattr(self.query_processor, 'gemini_client'):
              self.logger.info(f"Router Init: QP GeminiClient ID = {id(self.query_processor.gemini_client)}")
         if hasattr(self.query_agent, 'gemini_client'):
@@ -162,7 +166,7 @@ class MCPRouter:
         # Define routing map
         self.route_map = {
             "kpi extraction": self._handle_full_pipeline,
-            "comparative analysis": self._handle_full_pipeline,
+            "comparitive analysis": self._handle_full_pipeline,
             "trend analysis": self._handle_full_pipeline,
             "anomaly detection": self._handle_full_pipeline,
             "categorical breakdown": self._handle_full_pipeline,
@@ -188,7 +192,7 @@ class MCPRouter:
         self.logger.info(f"Stored session {session_id} in cache")
         self.logger.info(f"Cache now contains {len(session_cache)} sessions")
     
-    def route(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
+    def route(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None, send_callback: Optional[Callable] = None):
         """
         Route the question to the appropriate handler based on classification.
         
@@ -196,6 +200,7 @@ class MCPRouter:
             classification_context: Context containing the question classification
             session_manager: Optional session manager for updating session data
             previous_context: Optional dictionary containing previous question, summary, results
+            send_callback: Optional callback function to send graph filepath
             
         Returns:
             Context with appropriate response data
@@ -204,17 +209,20 @@ class MCPRouter:
         question_type = classification.question_type.lower()
         
         self.logger.info(f"Routing question type: {question_type} with confidence {classification.confidence}")
+        print(f"[DEBUG PRINT] Router received send_callback: {send_callback is not None}")
+        if send_callback:
+            print(f"[DEBUG PRINT] send_callback type: {type(send_callback)}")
         
         # Route to appropriate handler based on classification
         if question_type in self.route_map:
-            # Pass previous_context to the handler
-            return self.route_map[question_type](classification_context, session_manager, previous_context)
+            # Pass previous_context and send_callback to the handler
+            return self.route_map[question_type](classification_context, session_manager, previous_context, send_callback)
             
         else:
             # Default to full pipeline for unknown types
             self.logger.warning(f"Unknown question type: {question_type}. Defaulting to full pipeline.")
-            # Pass previous_context to the default handler too
-            return self._handle_full_pipeline(classification_context, session_manager, previous_context)
+            # Pass previous_context and send_callback to the default handler too
+            return self._handle_full_pipeline(classification_context, session_manager, previous_context, send_callback)
     
     def _create_response_context(self, classification_context: Context[ClassificationData], response_data: ResponseData):
         """Create a response context with appropriate metadata"""
@@ -231,10 +239,17 @@ class MCPRouter:
         
         return Context(data=response_data, metadata=metadata)
     
-    def _handle_full_pipeline(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
+    def _handle_full_pipeline(self, classification_context: Context[ClassificationData], session_manager: Optional[SessionManagerV2] = None, previous_context: Optional[Dict] = None, send_callback: Optional[Callable] = None):
         """Process through the complete MCP pipeline."""
+        # --- Use print for debugging ---
+        session_id = classification_context.metadata.session_id # Get session_id early
+        print(f"[ROUTER PRINT DEBUG {session_id}] STARTING _handle_full_pipeline.")
+        print(f"[DEBUG PRINT] _handle_full_pipeline received send_callback: {send_callback is not None}")
+        
+        start_time = time.time()
         classification = classification_context.data
-        self.logger.info(f"Handling full pipeline for: {classification.question}")
+        question_type = classification.question_type.lower()
+        self.logger.info(f"Handling full pipeline for: {classification.question} (Type: {question_type})")
         # Log if previous context is present
         if previous_context:
             self.logger.info("Received previous context for full pipeline.")
@@ -447,6 +462,61 @@ class MCPRouter:
                     tool_call_status[tool_name] = "failed"
                     continue
             
+            # --- ADD THIS PRINT STATEMENT ---
+            print(f"[ROUTER PRINT DEBUG {session_id}] Reached point just before graph condition check.")
+            # --------------------------------
+
+            # If results are available and it's a suitable question type, generate graph
+            # --- NEW LOG ---
+            self.logger.info(f"[ROUTER {session_id}] EVALUATING graph condition: has_results={bool(results)}, type='{question_type}'")
+            # Add more explicit debug for question type
+            print(f"[ROUTER DEBUG] Raw question_type: '{question_type}', transformed: '{question_type.lower().strip()}'")
+            self.logger.info(f"[ROUTER {session_id}] Exact question_type check: raw='{question_type}', transformed='{question_type.lower().strip()}'")
+            self.logger.info(f"[ROUTER {session_id}] Check result: {question_type.lower().strip() in ['trend analysis', 'comparitive analysis', 'trend', 'compare']}")
+            
+            # Check constraint comparison_type for additional fallback
+            comparison_type = constraints.get('comparison_type', '').lower().strip() if constraints else ''
+            self.logger.info(f"[ROUTER {session_id}] Constraint comparison_type: '{comparison_type}'")
+            
+            # Expanded condition to check question_type OR constraint comparison_type
+            should_generate_graph = (
+                question_type.lower().strip() in ["trend analysis", "comparitive analysis", "trend", "compare", "kpi extraction"] or
+                comparison_type in ["trend", "compare", "trend analysis", "comparitive analysis"]
+            )
+            self.logger.info(f"[ROUTER {session_id}] Final graph decision: {should_generate_graph}")
+            
+            if results and should_generate_graph:
+                # --- NEW LOG ---
+                self.logger.info(f"[ROUTER {session_id}] Graph condition MET. Proceeding to check constraints/session_id.")
+                if constraints and session_id:
+                     # --- NEW LOG ---
+                     self.logger.info(f"[ROUTER {session_id}] Constraints and session_id PRESENT. Creating Thread.")
+                     print(f"[DEBUG PRINT] About to create thread with send_callback: {send_callback is not None}")
+                     try:
+                         graph_thread = threading.Thread(
+                             target=self._generate_and_save_graph,
+                             args=(results, constraints, session_id, session_manager, send_callback),
+                             daemon=True
+                         )
+                         # --- NEW LOG ---
+                         self.logger.info(f"[ROUTER {session_id}] Thread object CREATED successfully.")
+                         graph_thread.start()
+                         # --- NEW LOG ---
+                         self.logger.info(f"[ROUTER {session_id}] Background graph generation thread STARTED for session {session_id}.")
+                     except Exception as thread_err:
+                         # --- NEW LOG ---
+                         self.logger.error(f"[ROUTER {session_id}] !!! EXCEPTION during Thread creation/start: {thread_err}", exc_info=True)
+
+                else:
+                    # --- NEW LOG ---
+                    self.logger.warning(f"[ROUTER {session_id}] Skipping graph task: constraints_present={bool(constraints)}, session_id_present={bool(session_id)}")
+            elif not results:
+                 # --- NEW LOG ---
+                 self.logger.info(f"[ROUTER {session_id}] Graph condition FAILED: No results.")
+            else:
+                 # --- NEW LOG ---
+                 self.logger.info(f"[ROUTER {session_id}] Graph condition FAILED: Question type '{question_type}' not suitable for graphing. Supported types: trend analysis, comparitive analysis")
+            
             # Step 4: Generate response using the response agent
             self.logger.info("Generating response...")
             self.logger.info(f"Results being passed to response agent: {json.dumps(results, indent=2, cls=DateTimeEncoder)}")
@@ -488,6 +558,8 @@ class MCPRouter:
             )
             
             # Step 5: Update session with results if we have a session manager
+            # NOTE: This update happens *before* the graph generation background task finishes.
+            # The background task will perform a *separate* update later if it succeeds.
             if session_manager:
                 try:
                     # Format updates according to the BigQuery schema
@@ -495,25 +567,28 @@ class MCPRouter:
                         "session_id": session_id,
                         "user_id": user_id,
                         "question": classification.question,
-                        "status": "completed",
+                        "status": "completed", # Mark as completed for text response, graph is async
                         "summary": response_text,
                         "updated_at": datetime.now().isoformat(),
                         "results": results,
                         "tool_calls": tool_calls,
                         "tool_call_status": tool_call_status,
                         "constraints": constraints
+                        # "graph_path": None # Explicitly set to None initially if the column exists
                     }
                     
-                    # Update the session with all results
                     session_manager.update_session(session_id, updates)
-                    self.logger.info(f"Updated session {session_id} with response")
+                    self.logger.info(f"Updated session {session_id} with primary response (graph pending).")
                 except Exception as e:
-                    self.logger.warning(f"Error updating session: {str(e)}")
+                    self.logger.warning(f"Error updating session with primary response: {str(e)}")
                     traceback.print_exc()
             
             # Create response context with the thread ID
             response_context = self._create_response_context(classification_context, response_data)
             response_context.metadata.session_id = session_id  # Ensure session_id is set in metadata
+
+            end_time = time.time()
+            print(f"[ROUTER PRINT DEBUG {session_id}] FINISHING _handle_full_pipeline. Duration: {end_time - start_time:.2f} seconds.")
             return response_context
             
         except Exception as e:
@@ -521,8 +596,112 @@ class MCPRouter:
             traceback.print_exc()
             return self._create_error_response(classification_context, str(e))
     
-    def _handle_planned_feature(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
-        """Handle a feature that is planned but not yet implemented."""
+    def _generate_and_save_graph(self, results: Dict[str, Dict[str, Any]], constraints: Dict[str, Any], session_id: str, session_manager: Optional[SessionManagerV2], send_callback: Optional[Callable] = None):
+        """Generates graph in background, saves it, and triggers callback."""
+        # --- NEW LOG ---
+        print(f"[DEBUG PRINT] _generate_and_save_graph STARTED with session_id: {session_id}")
+        print(f"[DEBUG PRINT] send_callback type: {type(send_callback)}, callable: {callable(send_callback) if send_callback else False}")
+        self.logger.info(f"[GraphBG {session_id}] STARTING _generate_and_save_graph background task.")
+        graph_filepath = None # Initialize filepath
+        
+        try:
+            self.logger.info(f"[GraphBG {session_id}] Initializing GraphGenerator...")
+            # Create a new instance to avoid potential thread safety issues
+            graph_generator = GraphGenerator()
+            
+            # Log what we're about to do with our input data
+            result_keys = list(results.keys()) if isinstance(results, dict) else "NOT A DICT"
+            self.logger.info(f"[GraphBG {session_id}] Input validation - results keys: {result_keys}")
+            self.logger.info(f"[GraphBG {session_id}] Input validation - has constraints: {bool(constraints)}")
+            
+            self.logger.info(f"[GraphBG {session_id}] Calling generate_line_graph...")
+            # --- Generate Graph ---
+            graph_filepath = graph_generator.generate_line_graph(results, constraints, session_id)
+            
+            # --- NEW LOG ---
+            self.logger.info(f"[GraphBG {session_id}] generate_line_graph finished. Filepath: {graph_filepath}")
+
+            if graph_filepath:
+                self.logger.info(f"[GraphBG {session_id}] Graph generated successfully at: {graph_filepath}")
+                
+                # Verify file exists
+                if os.path.exists(graph_filepath):
+                    self.logger.info(f"[GraphBG {session_id}] Verified graph file exists on disk: {graph_filepath}")
+                else:
+                    self.logger.error(f"[GraphBG {session_id}] !!! File reported by generate_line_graph DOES NOT EXIST: {graph_filepath}")
+                    raise FileNotFoundError(f"Generated graph file not found: {graph_filepath}")
+                
+                # Update session with graph filepath (optional, but can be useful)
+                if session_manager:
+                     try:
+                          self.logger.info(f"[GraphBG {session_id}] Attempting to update session with graph_path...")
+                          # Use the correct session manager method
+                          if hasattr(session_manager, 'update_session'):
+                               session_manager.update_session(session_id, {
+                                   "graph_path": graph_filepath,
+                                   "has_graph": True
+                               }) # Use graph_path to match BigQuery schema
+                               self.logger.info(f"[GraphBG {session_id}] Session update with graph_path and has_graph=True attempted.")
+                          else:
+                               self.logger.warning(f"[GraphBG {session_id}] Cannot update session graph_path, session_manager has no 'update_session' method.")
+                     except Exception as update_err:
+                          self.logger.error(f"[GraphBG {session_id}] Failed to update session with graph path: {update_err}", exc_info=True)
+
+                # --- CRITICAL: Check and Call Callback ---
+                print(f"[DEBUG PRINT] Checking send_callback exists: {send_callback is not None}")
+                if send_callback:
+                    print(f"[DEBUG PRINT] send_callback.__name__={getattr(send_callback, '__name__', 'no-name')}")
+                self.logger.info(f"[GraphBG {session_id}] Checking if send_callback exists: {send_callback is not None}")
+                
+                if send_callback:
+                    # --- NEW LOG ---
+                    print(f"[DEBUG PRINT] About to call send_callback({session_id}, {graph_filepath})")
+                    self.logger.info(f"[GraphBG {session_id}] send_callback exists. Preparing to call send_callback with filepath: {graph_filepath}")
+                    
+                    # Check callback is callable
+                    if not callable(send_callback):
+                        self.logger.error(f"[GraphBG {session_id}] !!! send_callback is not callable: {type(send_callback)}")
+                        return
+                        
+                    try:
+                        # Trigger the callback to send the graph with explicit try/except
+                        print(f"[DEBUG PRINT] Calling send_callback NOW")
+                        send_callback(session_id, graph_filepath)
+                        print(f"[DEBUG PRINT] send_callback executed successfully")
+                        self.logger.info(f"[GraphBG {session_id}] send_callback executed successfully.")
+                    except Exception as callback_err:
+                        print(f"[DEBUG PRINT] EXCEPTION in send_callback: {type(callback_err).__name__} - {str(callback_err)}")
+                        self.logger.error(f"[GraphBG {session_id}] !!! EXCEPTION during send_callback: {callback_err}", exc_info=True)
+                else:
+                    print(f"[DEBUG PRINT] No send_callback provided. Cannot send graph.")
+                    self.logger.warning(f"[GraphBG {session_id}] No send_callback provided. Cannot send graph.")
+            else:
+                self.logger.warning(f"[GraphBG {session_id}] Graph generation did not return a filepath.")
+
+        # --- UPDATED EXCEPTION LOGGING ---
+        except Exception as e:
+            print(f"[DEBUG PRINT] EXCEPTION in _generate_and_save_graph: {type(e).__name__} - {str(e)}")
+            self.logger.error(f"[GraphBG {session_id}] EXCEPTION in _generate_and_save_graph: {type(e).__name__} - {str(e)}")
+            self.logger.error(traceback.format_exc()) # Log the full traceback
+            # Optionally update session with graph error
+            if session_manager:
+                try:
+                    update_payload = {"graph_error": f"Graph generation failed: {type(e).__name__} - {str(e)}"}
+                    # Use the correct session manager method if it exists
+                    if hasattr(session_manager, 'update_session'):
+                         session_manager.update_session(session_id, update_payload)
+                         self.logger.info(f"[GraphBG {session_id}] Session updated with graph_error.")
+                    else:
+                         self.logger.warning(f"[GraphBG {session_id}] Cannot update session with graph_error, session_manager has no 'update_session' method.")
+                except Exception as update_err:
+                    self.logger.error(f"[GraphBG {session_id}] Failed to update session with graph error: {update_err}")
+        finally:
+             # --- NEW LOG ---
+             print(f"[DEBUG PRINT] _generate_and_save_graph FINISHED with session_id: {session_id}")
+             self.logger.info(f"[GraphBG {session_id}] FINISHING _generate_and_save_graph background task.")
+    
+    def _handle_planned_feature(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None, send_callback: Optional[Callable[[str, str], None]] = None):
+        """Handle planned features with a standard message."""
         classification = classification_context.data
         self.logger.info(f"Routing planned feature: {classification.question_type}")
         
@@ -532,7 +711,7 @@ class MCPRouter:
         )
         return self._create_response_context(classification_context, response_data)
     
-    def _handle_unsupported_feature(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
+    def _handle_unsupported_feature(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None, send_callback: Optional[Callable[[str, str], None]] = None):
         """Handle an unsupported feature request."""
         classification = classification_context.data
         self.logger.info(f"Routing unsupported feature: {classification.question}")
@@ -543,7 +722,7 @@ class MCPRouter:
         )
         return self._create_response_context(classification_context, response_data)
     
-    def _handle_clarification_needed(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
+    def _handle_clarification_needed(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None, send_callback: Optional[Callable[[str, str], None]] = None):
         """Handle a question that needs clarification."""
         classification = classification_context.data
         self.logger.info(f"Routing clarification needed: {classification.question}")
@@ -554,7 +733,7 @@ class MCPRouter:
         )
         return self._create_response_context(classification_context, response_data)
     
-    def _handle_small_talk(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
+    def _handle_small_talk(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None, send_callback: Optional[Callable[[str, str], None]] = None):
         """Handle small talk with a friendly response."""
         classification = classification_context.data
         self.logger.info(f"Routing small talk: {classification.question}")
@@ -565,7 +744,7 @@ class MCPRouter:
         )
         return self._create_response_context(classification_context, response_data)
     
-    def _handle_feedback(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
+    def _handle_feedback(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None, send_callback: Optional[Callable[[str, str], None]] = None):
         """Handle feedback by thanking the user and storing the feedback."""
         classification = classification_context.data
         self.logger.info(f"Routing feedback: {classification.question}")
@@ -744,7 +923,7 @@ class MCPRouter:
         
         return Context(data=response_data, metadata=metadata)
     
-    def _handle_ambiguous_question(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
+    def _handle_ambiguous_question(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None, send_callback: Optional[Callable[[str, str], None]] = None):
         """Handle ambiguous questions by asking for clarification."""
         classification = classification_context.data
         question = classification.question
@@ -859,7 +1038,7 @@ class MCPRouter:
         # Create and return the response context
         return self._create_response_context(classification_context, response_data)
     
-    def _handle_unsupported_construct(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None):
+    def _handle_unsupported_construct(self, classification_context: Context[ClassificationData], session_manager=None, previous_context: Optional[Dict] = None, send_callback: Optional[Callable[[str, str], None]] = None):
         """Handle questions classified as having unsupported NLP constructs."""
         classification = classification_context.data
         self.logger.info(f"Handling unsupported NLP construct: {classification.question}")

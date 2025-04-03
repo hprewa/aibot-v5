@@ -4,6 +4,17 @@ MCP-powered server for the Analytics Bot.
 This server uses the Model Context Protocol (MCP) to process analytical queries.
 It provides the same API as the original server but uses MCP internally for better
 traceability, debugging, and error handling.
+
+NOTE: For graph functionality to work properly, ensure your BigQuery sessions table
+has a 'graph_path' column of type STRING. If it doesn't exist, you can add it with:
+
+ALTER TABLE your_dataset.sessions 
+ADD COLUMN graph_path STRING;
+
+Also consider adding a 'has_graph' column of type BOOLEAN:
+
+ALTER TABLE your_dataset.sessions 
+ADD COLUMN has_graph BOOLEAN;
 """
 
 import os
@@ -12,7 +23,7 @@ import uvicorn
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
 from dotenv import load_dotenv
 import uuid
 from datetime import datetime
@@ -92,6 +103,9 @@ mcp_query_executor = MCPQueryExecutor(bigquery_client)
 mcp_response_generator = MCPResponseGenerator(response_agent)
 mcp_session_manager = MCPSessionManager(session_manager)
 
+# Create a router
+mcp_router = MCPRouter()
+
 # Create the flow orchestrator
 orchestrator = MCPQueryFlowOrchestrator(
     mcp_question_classifier,
@@ -101,6 +115,9 @@ orchestrator = MCPQueryFlowOrchestrator(
     mcp_response_generator,
     mcp_session_manager
 )
+
+# Set the router property on the orchestrator
+orchestrator.router = mcp_router
 
 # Initialize components if not already initialized
 mcp_components = None
@@ -164,7 +181,7 @@ def initialize_mcp():
         raise
 
 # Background task to process queries using the MCP flow
-async def process_query_task(user_id: str, question: str, session_id: str):
+async def process_query_task(user_id: str, question: str, session_id: str, send_callback: Optional[Callable] = None):
     """Process a query using the MCP flow"""
     try:
         # Create query data
@@ -176,7 +193,7 @@ async def process_query_task(user_id: str, question: str, session_id: str):
         )
         
         # Process the query through the MCP flow
-        orchestrator.process_query(query_data)
+        orchestrator.process_query(query_data, send_callback=send_callback)
         
     except Exception as e:
         # In case of errors, we still want to update the session status
@@ -192,12 +209,30 @@ async def submit_query(request: QueryRequest, background_tasks: BackgroundTasks)
         # Create a new session
         session_id = session_manager.create_session(request.user_id, request.question)
         
+        # Define a callback function for graph rendering
+        def graph_callback(cb_session_id: str, graph_filepath: str):
+            """Callback function to handle graph generation results"""
+            logger.info(f"Graph generated for session {cb_session_id}: {graph_filepath}")
+            # Note: In API mode we can only store the graph path; client needs to fetch it separately
+            # or we'd need to implement a /api/graph/{session_id} endpoint to serve the graph
+            try:
+                session_manager.update_session(cb_session_id, {
+                    "graph_path": graph_filepath,
+                    "has_graph": True
+                })
+                logger.info(f"Updated session {cb_session_id} with graph_path: {graph_filepath}")
+            except Exception as e:
+                logger.error(f"Failed to update session with graph_path: {str(e)}")
+                logger.error(f"This may be due to missing 'graph_path' column in the sessions table.")
+                logger.error(f"Consider adding this column or modifying the callback to use an existing column.")
+        
         # Process the query in the background
         background_tasks.add_task(
             process_query_task,
             request.user_id,
             request.question,
-            session_id
+            session_id,
+            send_callback=graph_callback
         )
         
         return QueryResponse(
@@ -312,6 +347,23 @@ async def process(request: ProcessRequest):
         logger.info(f"Session ID: {session_id}")
         logger.info(f"User ID: {user_id}")
         
+        # Define a callback function for graph rendering
+        def graph_callback(cb_session_id: str, graph_filepath: str):
+            """Callback function to handle graph generation results"""
+            logger.info(f"Graph generated for session {cb_session_id}: {graph_filepath}")
+            # Store the graph path in the session for API client to retrieve
+            if hasattr(mcp_session_manager, 'session_manager') and mcp_session_manager.session_manager:
+                try:
+                    mcp_session_manager.session_manager.update_session(cb_session_id, {
+                        "graph_path": graph_filepath,
+                        "has_graph": True
+                    })
+                    logger.info(f"Updated session {cb_session_id} with graph_path: {graph_filepath}")
+                except Exception as e:
+                    logger.error(f"Failed to update session with graph_path: {str(e)}")
+                    logger.error(f"This may be due to missing 'graph_path' column in the sessions table.")
+                    logger.error(f"Consider adding this column or modifying the callback to use an existing column.")
+        
         # Create query data with required fields
         query_data = QueryData(
             user_id=user_id,
@@ -361,7 +413,11 @@ async def process(request: ProcessRequest):
         if hasattr(mcp_session_manager, 'session_manager'):
             logger.info(f"Inner session_manager type: {type(mcp_session_manager.session_manager)}")
         
-        response_context = mcp_router.route(classification_context, session_manager=mcp_session_manager.session_manager)
+        response_context = mcp_router.route(
+            classification_context, 
+            session_manager=mcp_session_manager.session_manager,
+            send_callback=graph_callback
+        )
         
         # Extract response data
         logger.info("Processing response")

@@ -216,7 +216,7 @@ Provide your response as a JSON object with the following fields:
 - classification_metadata: Any additional metadata about the classification
 
 IMPORTANT RULES:
-1. For categories related to KPI queries (KPI Extraction, Comparative Analysis, Trend Analysis), always set requires_sql to true
+1. For categories related to KPI queries (KPI Extraction, Comparitive Analysis, Trend Analysis), always set requires_sql to true
 2. For categories like Small Talk, Metadata/Schema questions, and Unsupported/Random queries, set requires_sql to false
 3. Questions in categories like Small Talk and Feedback don't require summarization, set requires_summary to false
 4. **Crucially, identify "Follow-up question" if the user's query directly references the previous turn's results or asks for a modification of the previous analysis within the same conversation thread.** Follow-up questions usually require SQL, unless they *only* ask for clarification of the previous summary. Set requires_sql accordingly.

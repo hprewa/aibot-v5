@@ -6,7 +6,7 @@ Each processor implements the ContextProcessor interface and transforms
 contexts between components.
 """
 
-from typing import Dict, List, Any, Optional, Type, TypeVar, cast
+from typing import Dict, List, Any, Optional, Type, TypeVar, cast, Callable
 import json
 import traceback
 from datetime import datetime
@@ -1281,7 +1281,7 @@ class MCPQueryFlowOrchestrator:
         self.response_generator = response_generator
         self.session_manager = session_manager
         
-    def process_query(self, query_data: QueryData) -> Context[ResponseData]:
+    def process_query(self, query_data: QueryData, send_callback: Optional[Callable] = None) -> Context[ResponseData]:
         """
         Process a query through the full MCP flow.
         
@@ -1296,6 +1296,7 @@ class MCPQueryFlowOrchestrator:
         
         Args:
             query_data: The query data to process
+            send_callback: Optional callback function for sending graphs
             
         Returns:
             Context with the response data
@@ -1311,6 +1312,11 @@ class MCPQueryFlowOrchestrator:
         try:
             print(f"🔄 Starting processing for question: {query_data.question}")
             session_id = query_data.session_id
+            
+            # Add debug for callback
+            print(f"🔍 [DEBUG] Orchestrator process_query received send_callback? {send_callback is not None}")
+            if send_callback:
+                print(f"🔍 [DEBUG] send_callback type: {type(send_callback)}, callable: {callable(send_callback)}")
             
             # Step 1: Create a context from the query data
             query_context = Context(
@@ -1390,10 +1396,13 @@ class MCPQueryFlowOrchestrator:
                 try:
                     # Make sure we pass the underlying session_manager object, not the wrapper
                     # Also pass the fetched previous_context to the router
+                    # --- NEW: PASS SEND_CALLBACK to the router ---
+                    print(f"[DEBUG PRINT] MCPQueryFlowOrchestrator passing send_callback to router (exists: {send_callback is not None})")
                     response_context = self.router.route(
                         classification_context, 
                         self.session_manager.session_manager if hasattr(self.session_manager, 'session_manager') else None,
-                        previous_context=previous_context # Pass the fetched context
+                        previous_context=previous_context, # Pass the fetched context
+                        send_callback=send_callback # Pass the callback
                     )
                 except Exception as e:
                     error_msg = f"Error routing question: {str(e)}"

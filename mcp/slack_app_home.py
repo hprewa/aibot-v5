@@ -154,158 +154,109 @@ class MCPSlackAppHome:
         except Exception as e:
             print(f"⚠️ Error adding reaction: {str(e)}")
             # Continue without reaction if it fails
+            
+        # Create a graph callback that captures the channel ID
+        def graph_callback(session_id: str, graph_filepath: str):
+            print(f"[DEBUG] Graph callback triggered for session {session_id}, graph_path: {graph_filepath}")
+            print(f"[DEBUG] Using channel {channel} from closure")
+            try:
+                self._send_graph_to_slack(session_id, channel, graph_filepath)
+                print(f"[DEBUG] Graph callback completed successfully")
+            except Exception as e:
+                print(f"[DEBUG] Error in graph callback: {type(e).__name__} - {str(e)}")
+                traceback.print_exc()
         
         # Process the message - use thread_ts for session continuity
         threading.Thread(
             target=self._process_message,
-            args=(user, text, channel, thread_ts, ts),  # Pass both thread_ts and original ts
+            args=(user, text, channel, thread_ts, ts, graph_callback),  # Pass the callback
             daemon=True
         ).start()
         
         # Also update the App Home tab
         self._update_app_home(user)
     
-    def _process_message(self, user_id: str, question: str, channel: str, thread_ts: str, original_ts: str = None):
+    def _process_message(self, user_id: str, question: str, channel: str, thread_ts: str, original_ts: str = None, graph_callback: Callable[[str, str], None] = None):
         """Process a message using the MCP orchestrator"""
         try:
             print(f"🔄 Starting processing for question: {question}")
             
-            # Use thread_ts as the session ID for threading continuity
+            # Create a session ID from the thread timestamp
             session_id = thread_ts
-            
-            # Generate a session ID for this user if none exists
-            if user_id not in self.user_sessions:
-                self.user_sessions[user_id] = {
-                    "session_id": session_id,
-                    "messages": []
-                }
-            elif self.user_sessions[user_id]["session_id"] != session_id:
-                # If user starts a new thread, update the session ID
-                self.user_sessions[user_id]["session_id"] = session_id
-            
             print(f"🆔 Using session ID for user {user_id}: {session_id}")
             
-            # Add the user's message to the conversation history
-            self.user_sessions[user_id]["messages"].append({
-                "text": question,
-                "timestamp": datetime.now().isoformat(),
-                "is_user": True,
-                "thread_ts": thread_ts
-            })
-            
-            # Create query data using thread_ts as session ID for consistency
-            # This ensures all messages in the same thread are associated with the same session
+            # Create query data
             query_data = QueryData(
                 user_id=user_id,
                 question=question,
-                session_id=session_id,  # Use thread_ts as session_id
+                session_id=session_id,
                 created_at=datetime.now()
             )
-            
             print(f"📝 Created query data with session ID: {session_id}")
             
-            # Process the query
-            result_context = self.orchestrator.process_query(query_data)
+            # Process the query through the MCP flow
+            print(f"🔄 Starting processing for question: {question}")
+            print(f"🔍 [DEBUG] Orchestrator process_query received send_callback? {graph_callback is not None}")
             
-            # Handle the result
+            # Process the query and pass our callback
+            result_context = self.orchestrator.process_query(query_data, send_callback=graph_callback)
+            
+            # Handle the response
             if result_context.metadata.status == "error":
-                # Handle error
-                error_message = result_context.metadata.error_message or "An unknown error occurred"
+                error_message = result_context.metadata.error_message or "Unknown error occurred"
                 print(f"❌ Error processing query: {error_message}")
-                
-                # Add bot response to conversation history
-                self.user_sessions[user_id]["messages"].append({
-                    "text": f"Sorry, I encountered an error: {error_message}",
-                    "timestamp": datetime.now().isoformat(),
-                    "is_user": False,
-                    "is_error": True,
-                    "thread_ts": thread_ts
-                })
-                
-                # Send error message
                 self.send_message(
                     channel=channel,
                     text=f"Sorry, I encountered an error: {error_message}",
                     thread_ts=thread_ts
                 )
-                
-                # Update reactions
-                if original_ts:
-                    try:
-                        self.add_reaction(channel, original_ts, "x")
-                        self.remove_reaction(channel, original_ts, "hourglass_flowing_sand")
-                    except Exception as e:
-                        print(f"⚠️ Error updating reactions: {str(e)}")
+                # Update reaction to indicate error
+                try:
+                    self.remove_reaction(channel, original_ts, "hourglass_flowing_sand")
+                    self.add_reaction(channel, original_ts, "x")
+                except Exception as e:
+                    print(f"⚠️ Error updating reactions: {str(e)}")
             else:
-                # Extract the response data
+                # Success path
                 response_data = result_context.data
-                
-                # Get the summary
-                summary = response_data.summary or "No response was generated."
-                print(f"Response summary received from router: '{summary[:100]}...'")
-                
+                summary = getattr(response_data, 'summary', "No summary generated.")
                 print(f"✅ Successfully processed query. Sending response.")
                 
-                # Add bot response to conversation history
-                self.user_sessions[user_id]["messages"].append({
-                    "text": summary,
-                    "timestamp": datetime.now().isoformat(),
-                    "is_user": False,
-                    "thread_ts": thread_ts
-                })
-                
                 # Send the response
-                print(f"Attempting to send message to channel {channel} (thread: {thread_ts}) with text: '{summary[:100]}...'")
-                send_result = self.send_message(
+                print(f"Attempting to send message to channel {channel} (thread: {thread_ts}) with text: '{summary}'")
+                result = self.send_message(
                     channel=channel,
                     text=summary,
                     thread_ts=thread_ts
                 )
-                print(f"Result of send_message: {json.dumps(send_result)}")
+                print(f"Result of send_message: {json.dumps(result, indent=2)}")
                 
-                # Update reactions
-                if original_ts:
-                    try:
-                        self.add_reaction(channel, original_ts, "white_check_mark")
-                        self.remove_reaction(channel, original_ts, "hourglass_flowing_sand")
-                    except Exception as e:
-                        print(f"⚠️ Error updating reactions: {str(e)}")
+                # Update reaction to indicate success
+                try:
+                    self.remove_reaction(channel, original_ts, "hourglass_flowing_sand")
+                    self.add_reaction(channel, original_ts, "white_check_mark")
+                except Exception as e:
+                    print(f"⚠️ Error updating reactions: {str(e)}")
             
-            # Update the App Home tab with the latest conversation
+            # Update the App Home tab
             self._update_app_home(user_id)
-                
+            
         except Exception as e:
-            # Handle any unexpected errors
-            error_msg = f"Sorry, an unexpected error occurred: {str(e)}"
-            print(f"❌ Unexpected error: {str(e)}")
+            print(f"❌ Error in _process_message: {str(e)}")
             traceback.print_exc()
-            
-            # Add error to conversation history
-            if user_id in self.user_sessions:
-                self.user_sessions[user_id]["messages"].append({
-                    "text": error_msg,
-                    "timestamp": datetime.now().isoformat(),
-                    "is_user": False,
-                    "is_error": True,
-                    "thread_ts": thread_ts
-                })
-            
-            # Send error message
+            # Send error message to Slack
             self.send_message(
                 channel=channel,
-                text=error_msg,
+                text=f"Sorry, I encountered an unexpected error: {str(e)}",
                 thread_ts=thread_ts
             )
-            
-            # Update reactions
-            if original_ts:
-                try:
-                    self.add_reaction(channel, original_ts, "x")
-                    self.remove_reaction(channel, original_ts, "hourglass_flowing_sand")
-                except Exception as reaction_error:
-                    print(f"⚠️ Error updating reactions: {str(reaction_error)}")
-            
-            # Update the App Home tab with the error
+            # Update reaction to indicate error
+            try:
+                self.remove_reaction(channel, original_ts, "hourglass_flowing_sand")
+                self.add_reaction(channel, original_ts, "x")
+            except Exception as e:
+                print(f"⚠️ Error updating reactions: {str(e)}")
+            # Update App Home even on error
             self._update_app_home(user_id)
     
     def _update_app_home(self, user_id: str):
@@ -439,6 +390,104 @@ class MCPSlackAppHome:
         })
         
         return blocks
+    
+    def _send_graph_to_slack(self, session_id: str, channel: str, graph_filepath: str):
+        """Send a graph to Slack using the session ID as the thread timestamp."""
+        try:
+            print(f"[DEBUG] Starting _send_graph_to_slack with session_id={session_id}, channel={channel}, graph_filepath={graph_filepath}")
+            
+            # Check if we have a bot token
+            if not self.bot_token:
+                print("❌ Cannot send graph: No bot token available")
+                return
+                
+            # Verify the graph file exists
+            if not os.path.exists(graph_filepath):
+                print(f"❌ Graph file not found: {graph_filepath}")
+                return
+                
+            print(f"[DEBUG] Using channel_id={channel} for session {session_id}")
+            
+            # First try with requests library
+            try:
+                print("[DEBUG] Attempting upload with requests library...")
+                headers = {
+                    "Authorization": f"Bearer {self.bot_token}",
+                }
+                
+                payload = {
+                    'channels': channel,
+                    'thread_ts': session_id,
+                    'initial_comment': 'Here is the graph for your query:',
+                    'title': "Analytics Graph"
+                }
+                
+                with open(graph_filepath, 'rb') as file_content:
+                    files = {'file': (os.path.basename(graph_filepath), file_content, 'image/png')}
+                    response = requests.post(
+                        "https://slack.com/api/files.upload",
+                        headers=headers,
+                        data=payload,
+                        files=files,
+                        timeout=60
+                    )
+                    
+                response_data = response.json()
+                print(f"[DEBUG] Requests upload response: {json.dumps(response_data, indent=2)}")
+             
+                if response_data.get("ok"):
+                    print("✅ Graph uploaded successfully via requests")
+                    return
+                    
+            except Exception as requests_error:
+                print(f"⚠️ Requests upload failed: {str(requests_error)}")
+                print("Attempting fallback with slack-sdk...")
+                
+                try:
+                    from slack_sdk import WebClient
+                    from slack_sdk.errors import SlackApiError
+                    
+                    print("[DEBUG] Initializing WebClient...")
+                    client = WebClient(token=self.bot_token)
+                    
+                    print("[DEBUG] Preparing upload parameters...")
+                    params = {
+                        "file": graph_filepath,
+                        "channels": channel,
+                        "thread_ts": session_id,
+                        "initial_comment": "Here is the graph for your query:"
+                    }
+                    
+                    print("[DEBUG] Attempting upload with slack-sdk...")
+                    try:
+                        response = client.files_upload_v2(**params)
+                       
+                    except:
+                        print("[DEBUG] files_upload_v2 not available, falling back to files_upload")
+                        response = client.files_upload(**params)
+                        
+                    print(f"[DEBUG] Slack SDK upload response: {json.dumps(response.data, indent=2) if hasattr(response, 'data') else response}")
+                    
+                    if response.get("ok"):
+                        print("✅ Graph uploaded successfully via slack-sdk")
+                        return
+                        
+                except Exception as sdk_error:
+                    print(f"❌ Slack SDK upload failed: {str(sdk_error)}")
+                    raise
+                    
+        except Exception as e:
+            print(f"❌ Error in _send_graph_to_slack: {str(e)}")
+            traceback.print_exc()
+            
+        finally:
+            # Clean up the graph file
+            try:
+                if os.path.exists(graph_filepath):
+                    os.remove(graph_filepath)
+                    print(f"✅ Cleaned up graph file: {graph_filepath}")
+            except Exception as cleanup_error:
+                print(f"⚠️ Error cleaning up graph file: {str(cleanup_error)}")
     
     def start(self, port: int = 8000):
         """Start the Slack App Home integration server"""
