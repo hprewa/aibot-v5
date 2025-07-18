@@ -1,3 +1,6 @@
+https://github.com/user-attachments/assets/d3ca7ecc-56da-4deb-bba4-288e2388e300
+
+
 # Analytics Bot with BigQuery Session Management
 
 A system that processes analytical queries using Google BigQuery and Vertex AI (Gemini), with a robust session management system that tracks query state and results.
